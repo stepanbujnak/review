@@ -69,6 +69,7 @@ review --help
 | `ctrl+p` | Toggle side panel (shown by default) |
 | `ctrl+w` | Toggle whitespace changes (hidden by default) |
 | `ctrl+u` | Toggle untracked files (shown by default) |
+| `ctrl+z` | Toggle line wrapping (off by default) |
 | `r` | Mark currently viewed file as reviewed |
 | `n` / `p` | Jump to next / previous unreviewed file |
 | `j` / `k` or `↓` / `↑` | Scroll down / up |
@@ -85,7 +86,7 @@ review --help
 - **Changed files**: Click a file in the side panel to jump to its diff.
 - **Directories**: Click a directory row to collapse or expand it.
 - **Reviewed files**: Click a reviewed file in the side panel to un-review it and jump back to it.
-- **Footer bar**: Click `^p panel`, `^w ws`, `^u untracked`, or `r review` to trigger the corresponding action.
+- **Footer bar**: Click `^p panel`, `^z wrap`, `^w ws`, `^u untracked`, or `r review` to trigger the corresponding action.
 
 ## Development
 

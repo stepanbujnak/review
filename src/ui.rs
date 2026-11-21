@@ -103,6 +103,7 @@ struct UiContext {
     btn_panel: Text,
     btn_ws: Text,
     btn_untracked: Text,
+    btn_wrap: Text,
     btn_review: Text,
     footer_status: Text,
     /// Ordered list of file sections currently mounted in `main_scroll`.
@@ -156,6 +157,7 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
     let btn_panel = make_footer_button(app);
     let btn_ws = make_footer_button(app);
     let btn_untracked = make_footer_button(app);
+    let btn_wrap = make_footer_button(app);
     let btn_review = make_footer_button(app);
 
     let footer_buttons = View::new(app)
@@ -163,6 +165,7 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         .gap(1)
         .shrink(0.0)
         .child(&btn_panel)
+        .child(&btn_wrap)
         .child(&btn_ws)
         .child(&btn_untracked)
         .child(&btn_review);
@@ -197,6 +200,7 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         btn_panel: btn_panel.clone(),
         btn_ws: btn_ws.clone(),
         btn_untracked: btn_untracked.clone(),
+        btn_wrap: btn_wrap.clone(),
         btn_review: btn_review.clone(),
         footer_status,
         sections: Vec::new(),
@@ -221,6 +225,10 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
     {
         let ctx_btn = Rc::clone(&ctx);
         btn_untracked.on_click(move |_cx, _ev| toggle_untracked(&ctx_btn));
+    }
+    {
+        let ctx_btn = Rc::clone(&ctx);
+        btn_wrap.on_click(move |_cx, _ev| toggle_wrap(&ctx_btn));
     }
     {
         let ctx_btn = Rc::clone(&ctx);
@@ -283,8 +291,9 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         let ctx_resize = Rc::clone(&ctx);
         main_scroll.on_resize(move |_cx, _rect| {
             let mut inner = ctx_resize.borrow_mut();
+            let wrap_lines = inner.state.wrap_lines;
             for section in &mut inner.sections {
-                apply_section_horizontal_scroll(section);
+                apply_section_horizontal_scroll(section, wrap_lines);
             }
         });
     }
@@ -329,6 +338,27 @@ fn toggle_whitespace(ctx: &Rc<RefCell<UiContext>>) {
     reload_from_git(ctx);
 }
 
+fn toggle_wrap(ctx: &Rc<RefCell<UiContext>>) {
+    let mut inner = ctx.borrow_mut();
+    inner.state.wrap_lines = !inner.state.wrap_lines;
+    let wrap_lines = inner.state.wrap_lines;
+    let mode = wrap_mode(wrap_lines);
+    for section in &mut inner.sections {
+        section.header_text.wrap(mode);
+        section.body_text.wrap(mode);
+        apply_section_horizontal_scroll(section, wrap_lines);
+    }
+    update_footer(&inner);
+}
+
+fn wrap_mode(wrap_lines: bool) -> WrapMode {
+    if wrap_lines {
+        WrapMode::Char
+    } else {
+        WrapMode::None
+    }
+}
+
 fn mark_current_reviewed(ctx: &Rc<RefCell<UiContext>>) {
     let changed = {
         let mut inner = ctx.borrow_mut();
@@ -362,6 +392,11 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
 
     if key.matches("ctrl+w") {
         toggle_whitespace(ctx);
+        return;
+    }
+
+    if key.matches("ctrl+z") {
+        toggle_wrap(ctx);
         return;
     }
 
@@ -621,7 +656,7 @@ fn build_side_file_row(
 }
 
 fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
-    let (app, main_scroll, unreviewed, total, pending_target) = {
+    let (app, main_scroll, unreviewed, total, pending_target, wrap_lines) = {
         let mut inner = ctx.borrow_mut();
         let unreviewed: Vec<DiffFile> = inner
             .state
@@ -635,6 +670,7 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
             unreviewed,
             inner.state.total_count(),
             inner.pending_scroll_to.take(),
+            inner.state.wrap_lines,
         )
     };
 
@@ -653,7 +689,7 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
         main_scroll.add(&empty);
     } else {
         for file in &unreviewed {
-            let section = build_file_section(&app, file);
+            let section = build_file_section(&app, file, wrap_lines);
             if pending_target.as_deref() == Some(file.path.as_str()) {
                 let scroll = main_scroll.clone();
                 let applied = std::cell::Cell::new(false);
@@ -671,7 +707,8 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
     ctx.borrow_mut().sections = sections;
 }
 
-fn build_file_section(app: &App, file: &DiffFile) -> FileSection {
+fn build_file_section(app: &App, file: &DiffFile, wrap_lines: bool) -> FileSection {
+    let mode = wrap_mode(wrap_lines);
     let status_fg = status_color(file.status);
     let mut header_spans = vec![
         Span::styled(
@@ -703,7 +740,7 @@ fn build_file_section(app: &App, file: &DiffFile) -> FileSection {
         }
     }
 
-    let header_text = Text::new(app, header_spans).wrap(WrapMode::None);
+    let header_text = Text::new(app, header_spans).wrap(mode);
     let header_width = header_text.info().width_max;
 
     let header = View::new(app)
@@ -727,7 +764,7 @@ fn build_file_section(app: &App, file: &DiffFile) -> FileSection {
         diff_spans.push(Span::styled(line.text.clone(), style));
     }
 
-    let body_text = Text::new(app, diff_spans).wrap(WrapMode::None);
+    let body_text = Text::new(app, diff_spans).wrap(mode);
     let body_width = body_text.info().width_max;
 
     let body = View::new(app)
@@ -773,7 +810,13 @@ fn section_max_scroll_x(section: &FileSection) -> f64 {
         .max(text_max_scroll_x(&section.body_text, section.body_width))
 }
 
-fn apply_section_horizontal_scroll(section: &mut FileSection) {
+fn apply_section_horizontal_scroll(section: &mut FileSection, wrap_lines: bool) {
+    if wrap_lines {
+        section.scroll_x = 0.0;
+        section.header_text.scroll_to(0.0, 0.0);
+        section.body_text.scroll_to(0.0, 0.0);
+        return;
+    }
     let max_x = section_max_scroll_x(section);
     section.scroll_x = section.scroll_x.clamp(0.0, max_x).round();
     let x = section.scroll_x;
@@ -794,15 +837,21 @@ fn active_section_index(inner: &UiContext) -> Option<usize> {
 
 fn scroll_horizontal_by(ctx: &Rc<RefCell<UiContext>>, dx: f64) {
     let mut inner = ctx.borrow_mut();
+    if inner.state.wrap_lines {
+        return;
+    }
     if let Some(idx) = active_section_index(&inner) {
         let section = &mut inner.sections[idx];
         section.scroll_x += dx;
-        apply_section_horizontal_scroll(section);
+        apply_section_horizontal_scroll(section, false);
     }
 }
 
 fn scroll_horizontal_at(ctx: &Rc<RefCell<UiContext>>, x: u16, y: u16, dx: f64) {
     let mut inner = ctx.borrow_mut();
+    if inner.state.wrap_lines {
+        return;
+    }
     let idx = inner
         .sections
         .iter()
@@ -811,27 +860,29 @@ fn scroll_horizontal_at(ctx: &Rc<RefCell<UiContext>>, x: u16, y: u16, dx: f64) {
     if let Some(idx) = idx {
         let section = &mut inner.sections[idx];
         section.scroll_x += dx;
-        apply_section_horizontal_scroll(section);
+        apply_section_horizontal_scroll(section, false);
     }
 }
 
 fn reset_horizontal_scroll(ctx: &Rc<RefCell<UiContext>>) {
     let mut inner = ctx.borrow_mut();
+    let wrap_lines = inner.state.wrap_lines;
     if let Some(idx) = active_section_index(&inner) {
         let section = &mut inner.sections[idx];
         section.scroll_x = 0.0;
-        apply_section_horizontal_scroll(section);
+        apply_section_horizontal_scroll(section, wrap_lines);
     }
 }
 
 fn scroll_to_file(ctx: &Rc<RefCell<UiContext>>, path: &str) {
     let mut inner = ctx.borrow_mut();
+    let wrap_lines = inner.state.wrap_lines;
     if let Some(idx) = inner.sections.iter().position(|s| s.path == path) {
         let target_y = f64::from(inner.sections[idx].view.rect().top).max(0.0);
         inner.main_scroll.scroll_to(0.0, target_y);
         let section = &mut inner.sections[idx];
         section.scroll_x = 0.0;
-        apply_section_horizontal_scroll(section);
+        apply_section_horizontal_scroll(section, wrap_lines);
     }
 }
 
@@ -898,6 +949,7 @@ fn update_footer(inner: &UiContext) {
     let panel_on = !inner.state.hide_side_panel;
     let ws_on = !inner.state.hide_whitespace;
     let untracked_on = !inner.state.hide_untracked;
+    let wrap_on = inner.state.wrap_lines;
 
     style_toggle_button(
         &inner.btn_panel,
@@ -913,6 +965,11 @@ fn update_footer(inner: &UiContext) {
         &inner.btn_untracked,
         &format!("^u untracked:{}", if untracked_on { "on" } else { "off" }),
         untracked_on,
+    );
+    style_toggle_button(
+        &inner.btn_wrap,
+        &format!("^z wrap:{}", if wrap_on { "on" } else { "off" }),
+        wrap_on,
     );
 
     if inner.state.active_file.is_some() {
@@ -1580,5 +1637,72 @@ mod tests {
             !after_vertical_resume.contains("M src/long.rs"),
             "vertical scroll should resume after axis lock expires:\n{after_vertical_resume}"
         );
+    }
+
+    #[test]
+    fn toggle_wrap_via_shortcut_and_footer_button_wraps_long_lines() {
+        let app = TestApp::with_options(
+            100,
+            20,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let long_line = format!("+START_MARKER_{}_END_MARKER", "x".repeat(80));
+        let files = vec![DiffFile {
+            path: "src/long.rs".to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_binary: false,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::HunkHeader,
+                    text: "@@ -1,1 +1,2 @@".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: long_line,
+                },
+            ],
+        }];
+        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
+        mount(&app, state, loader);
+
+        // Wrap is off by default: long line is clipped.
+        let initial = capture_text(&app.render());
+        assert!(initial.contains("START_MARKER"));
+        assert!(!initial.contains("END_MARKER"));
+        assert!(initial.contains(" ^z wrap:off "));
+
+        // Scroll horizontally first, then toggle wrap on with ctrl+z:
+        // horizontal offset should reset and both START_MARKER and END_MARKER should be visible.
+        for _ in 0..10 {
+            app.press("l");
+        }
+        app.press("ctrl+z");
+        let wrapped = capture_text(&app.render());
+        assert!(
+            wrapped.contains(" ^z wrap:on "),
+            "footer should show wrap:on:\n{wrapped}"
+        );
+        assert!(
+            wrapped.contains("START_MARKER") && wrapped.contains("END_MARKER"),
+            "wrapped view should show both start and end of long line:\n{wrapped}"
+        );
+
+        // Clicking the wrap button in the footer toggles wrap back off.
+        let capture = app.render();
+        let footer_y = (capture.height - 1) as u16;
+        let footer_row = capture.row(capture.height - 1);
+        let wrap_x = footer_row.find(" ^z wrap:on ").expect("wrap button") as u16 + 2;
+        app.click(wrap_x, footer_y);
+        let unwrapped = capture_text(&app.render());
+        assert!(
+            unwrapped.contains(" ^z wrap:off "),
+            "footer should show wrap:off:\n{unwrapped}"
+        );
+        assert!(unwrapped.contains("START_MARKER"));
+        assert!(!unwrapped.contains("END_MARKER"));
     }
 }

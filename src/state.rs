@@ -9,6 +9,7 @@ pub struct AppState {
     pub hide_untracked: bool,
     pub hide_whitespace: bool,
     pub hide_side_panel: bool,
+    pub wrap_lines: bool,
     pub active_file: Option<String>,
     pub collapsed_dirs: HashSet<String>,
     pub target: DiffTarget,
@@ -24,6 +25,7 @@ impl AppState {
             hide_untracked: false,
             hide_whitespace: true,
             hide_side_panel: false,
+            wrap_lines: false,
             active_file,
             collapsed_dirs: HashSet::new(),
             target,
@@ -169,6 +171,7 @@ mod tests {
         assert!(!state.hide_untracked);
         assert!(state.hide_whitespace);
         assert!(!state.hide_side_panel);
+        assert!(!state.wrap_lines);
         assert_eq!(state.active_file.as_deref(), Some("a.rs"));
     }
 

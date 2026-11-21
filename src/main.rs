@@ -39,6 +39,7 @@ KEYBINDINGS:
     ctrl+p                Toggle side panel (shown by default)
     ctrl+w                Toggle whitespace changes (hidden by default)
     ctrl+u                Toggle untracked files (shown by default)
+    ctrl+z                Toggle line wrapping (off by default)
     r                     Mark currently viewed file as reviewed
     n / p                 Next / previous unreviewed file
     j / k / h / l         Scroll down / up / left / right
