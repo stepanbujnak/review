@@ -6,8 +6,73 @@ use opentui::widget::ScrollCause;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 const SIDE_PANEL_WIDTH: u16 = 34;
+/// Suppresses stray cross-axis trackpad ticks right after scrolling on the other axis.
+const AXIS_LOCK_DURATION: Duration = Duration::from_millis(120);
+/// Pause after which a horizontal trackpad gesture resets its deadzone.
+const HORIZONTAL_GESTURE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Consecutive horizontal ticks required before a trackpad swipe begins scrolling.
+const HORIZONTAL_SCROLL_DEADZONE: u8 = 3;
+
+#[derive(Default)]
+struct WheelAxisFilter {
+    last_vertical: Option<Instant>,
+    last_horizontal_active: Option<Instant>,
+    last_horizontal_raw: Option<Instant>,
+    h_direction: i8,
+    h_ticks: u8,
+}
+
+impl WheelAxisFilter {
+    /// Returns `true` if a non-Shift vertical wheel tick should be allowed,
+    /// or `false` if suppressed because the user is actively side-scrolling.
+    fn allow_vertical(&mut self, now: Instant) -> bool {
+        if self
+            .last_horizontal_active
+            .is_some_and(|t| now.saturating_duration_since(t) < AXIS_LOCK_DURATION)
+        {
+            return false;
+        }
+        self.last_vertical = Some(now);
+        self.h_direction = 0;
+        self.h_ticks = 0;
+        true
+    }
+
+    /// Returns the horizontal column delta to apply for a non-Shift horizontal wheel tick,
+    /// or `None` if suppressed by the vertical-scroll lock or deadzone.
+    fn filter_horizontal(&mut self, now: Instant, dir: i8) -> Option<f64> {
+        if self
+            .last_vertical
+            .is_some_and(|t| now.saturating_duration_since(t) < AXIS_LOCK_DURATION)
+        {
+            self.h_direction = 0;
+            self.h_ticks = 0;
+            return None;
+        }
+
+        let timed_out = self
+            .last_horizontal_raw
+            .is_none_or(|t| now.saturating_duration_since(t) > HORIZONTAL_GESTURE_TIMEOUT);
+        self.last_horizontal_raw = Some(now);
+
+        if timed_out || self.h_direction != dir {
+            self.h_direction = dir;
+            self.h_ticks = 1;
+        } else {
+            self.h_ticks = self.h_ticks.saturating_add(1);
+        }
+
+        if self.h_ticks < HORIZONTAL_SCROLL_DEADZONE {
+            return None;
+        }
+
+        self.last_horizontal_active = Some(now);
+        Some(f64::from(dir))
+    }
+}
 
 pub type DiffLoader = Rc<dyn Fn(&DiffOptions) -> std::result::Result<Vec<DiffFile>, String>>;
 
@@ -16,6 +81,16 @@ struct SideFileRow {
     prefix: String,
     label: String,
     status: FileStatus,
+}
+
+struct FileSection {
+    path: String,
+    view: View,
+    header_text: Text,
+    header_width: u32,
+    body_text: Text,
+    body_width: u32,
+    scroll_x: f64,
 }
 
 struct UiContext {
@@ -30,8 +105,10 @@ struct UiContext {
     btn_untracked: Text,
     btn_review: Text,
     footer_status: Text,
-    /// Ordered list of (path, section_view) currently mounted in `main_scroll`.
-    section_views: Vec<(String, View)>,
+    /// Ordered list of file sections currently mounted in `main_scroll`.
+    sections: Vec<FileSection>,
+    /// Filters accidental diagonal cross-axis trackpad ticks while scrolling.
+    wheel_filter: WheelAxisFilter,
     /// Map of unreviewed file path -> its side panel row for fast highlight updates.
     side_file_widgets: HashMap<String, SideFileRow>,
     /// Last error message from reloading git diff, if any.
@@ -66,7 +143,7 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         .grow(1.0)
         .min_width(0)
         .min_height(0)
-        .axes(true, true)
+        .axes(false, true)
         .layout_mode(LayoutMode::List)
         .scrollbars(false);
     // Clear ScrollBox's default keymap so our global vim/navigation keys act consistently.
@@ -122,7 +199,8 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         btn_untracked: btn_untracked.clone(),
         btn_review: btn_review.clone(),
         footer_status,
-        section_views: Vec::new(),
+        sections: Vec::new(),
+        wheel_filter: WheelAxisFilter::default(),
         side_file_widgets: HashMap::new(),
         last_error: None,
         pending_scroll_to: None,
@@ -158,6 +236,56 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
                 return;
             }
             sync_active_file_from_scroll(&ctx_scroll);
+        });
+    }
+
+    // Horizontal mouse wheel / trackpad scroll inside the hovered (or active) file border,
+    // with symmetric axis locking to prevent accidental diagonal cross-axis scrolling.
+    {
+        let ctx_mouse = Rc::clone(&ctx);
+        main_scroll.on_mouse(move |cx, event| {
+            let shift = event.modifiers.contains(Modifiers::SHIFT);
+            match (event.kind, shift) {
+                (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown, false) => {
+                    if !ctx_mouse.borrow_mut().wheel_filter.allow_vertical(cx.now()) {
+                        cx.prevent_default();
+                    }
+                }
+                (MouseEventKind::ScrollLeft, false) => {
+                    let dx = ctx_mouse.borrow_mut().wheel_filter.filter_horizontal(cx.now(), -1);
+                    if let Some(dx) = dx {
+                        scroll_horizontal_at(&ctx_mouse, event.x, event.y, dx);
+                    }
+                    cx.prevent_default();
+                }
+                (MouseEventKind::ScrollRight, false) => {
+                    let dx = ctx_mouse.borrow_mut().wheel_filter.filter_horizontal(cx.now(), 1);
+                    if let Some(dx) = dx {
+                        scroll_horizontal_at(&ctx_mouse, event.x, event.y, dx);
+                    }
+                    cx.prevent_default();
+                }
+                (MouseEventKind::ScrollUp, true) => {
+                    scroll_horizontal_at(&ctx_mouse, event.x, event.y, -2.0);
+                    cx.prevent_default();
+                }
+                (MouseEventKind::ScrollDown, true) => {
+                    scroll_horizontal_at(&ctx_mouse, event.x, event.y, 2.0);
+                    cx.prevent_default();
+                }
+                _ => {}
+            }
+        });
+    }
+
+    // Re-clamp horizontal text scroll when the main viewport resizes (e.g., terminal resize or panel toggle).
+    {
+        let ctx_resize = Rc::clone(&ctx);
+        main_scroll.on_resize(move |_cx, _rect| {
+            let mut inner = ctx_resize.borrow_mut();
+            for section in &mut inner.sections {
+                apply_section_horizontal_scroll(section);
+            }
         });
     }
 
@@ -276,9 +404,9 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
         main.scroll_by(0.0, -1.0);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("h") || key.matches("left") {
-        main.scroll_by(-4.0, 0.0);
+        scroll_horizontal_by(ctx, -4.0);
     } else if key.matches("l") || key.matches("right") {
-        main.scroll_by(4.0, 0.0);
+        scroll_horizontal_by(ctx, 4.0);
     } else if key.matches("pagedown") || key.matches("space") || key.matches("ctrl+d") {
         main.scroll_by(0.0, page);
         sync_active_file_from_scroll(ctx);
@@ -287,6 +415,7 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
         sync_active_file_from_scroll(ctx);
     } else if key.matches("g") || key.matches("home") {
         main.scroll_to(0.0, 0.0);
+        reset_horizontal_scroll(ctx);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("G") || key.matches("end") {
         main.scroll_to_bottom();
@@ -510,7 +639,7 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
     };
 
     main_scroll.clear();
-    let mut section_views = Vec::with_capacity(unreviewed.len());
+    let mut sections = Vec::with_capacity(unreviewed.len());
 
     if unreviewed.is_empty() {
         let message = if total == 0 {
@@ -528,21 +657,21 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
             if pending_target.as_deref() == Some(file.path.as_str()) {
                 let scroll = main_scroll.clone();
                 let applied = std::cell::Cell::new(false);
-                section.on_resize(move |_cx, rect| {
+                section.view.on_resize(move |_cx, rect| {
                     if !applied.replace(true) {
                         scroll.scroll_to(0.0, f64::from(rect.top).max(0.0));
                     }
                 });
             }
-            main_scroll.add(&section);
-            section_views.push((file.path.clone(), section));
+            main_scroll.add(&section.view);
+            sections.push(section);
         }
     }
 
-    ctx.borrow_mut().section_views = section_views;
+    ctx.borrow_mut().sections = sections;
 }
 
-fn build_file_section(app: &App, file: &DiffFile) -> View {
+fn build_file_section(app: &App, file: &DiffFile) -> FileSection {
     let status_fg = status_color(file.status);
     let mut header_spans = vec![
         Span::styled(
@@ -574,11 +703,14 @@ fn build_file_section(app: &App, file: &DiffFile) -> View {
         }
     }
 
+    let header_text = Text::new(app, header_spans).wrap(WrapMode::None);
+    let header_width = header_text.info().width_max;
+
     let header = View::new(app)
         .border_sides(Sides::BOTTOM)
         .border_color(Color::BRIGHT_BLACK)
         .padding_x(1)
-        .child(&Text::new(app, header_spans).wrap(WrapMode::None));
+        .child(&header_text);
 
     let mut diff_spans = Vec::with_capacity(file.lines.len() * 2);
     for (idx, line) in file.lines.iter().enumerate() {
@@ -595,18 +727,31 @@ fn build_file_section(app: &App, file: &DiffFile) -> View {
         diff_spans.push(Span::styled(line.text.clone(), style));
     }
 
+    let body_text = Text::new(app, diff_spans).wrap(WrapMode::None);
+    let body_width = body_text.info().width_max;
+
     let body = View::new(app)
         .padding_x(1)
-        .child(&Text::new(app, diff_spans).wrap(WrapMode::None));
+        .child(&body_text);
 
-    View::new(app)
+    let view = View::new(app)
         .column()
         .border(BorderStyle::Rounded)
         .border_color(Color::BRIGHT_BLACK)
         .margin_x(1)
         .margin_edge(Edge::Bottom, 1)
         .child(&header)
-        .child(&body)
+        .child(&body);
+
+    FileSection {
+        path: file.path.clone(),
+        view,
+        header_text,
+        header_width,
+        body_text,
+        body_width,
+        scroll_x: 0.0,
+    }
 }
 
 fn status_color(status: FileStatus) -> Color {
@@ -618,11 +763,75 @@ fn status_color(status: FileStatus) -> Color {
     }
 }
 
+fn text_max_scroll_x(text: &Text, content_width: u32) -> f64 {
+    let visible = f64::from(text.rect().width);
+    (f64::from(content_width) - visible).max(0.0).floor()
+}
+
+fn section_max_scroll_x(section: &FileSection) -> f64 {
+    text_max_scroll_x(&section.header_text, section.header_width)
+        .max(text_max_scroll_x(&section.body_text, section.body_width))
+}
+
+fn apply_section_horizontal_scroll(section: &mut FileSection) {
+    let max_x = section_max_scroll_x(section);
+    section.scroll_x = section.scroll_x.clamp(0.0, max_x).round();
+    let x = section.scroll_x;
+    let header_x = x.min(text_max_scroll_x(&section.header_text, section.header_width));
+    let body_x = x.min(text_max_scroll_x(&section.body_text, section.body_width));
+    section.header_text.scroll_to(header_x, 0.0);
+    section.body_text.scroll_to(body_x, 0.0);
+}
+
+fn active_section_index(inner: &UiContext) -> Option<usize> {
+    if let Some(active) = inner.state.active_file.as_deref()
+        && let Some(idx) = inner.sections.iter().position(|s| s.path == active)
+    {
+        return Some(idx);
+    }
+    (!inner.sections.is_empty()).then_some(0)
+}
+
+fn scroll_horizontal_by(ctx: &Rc<RefCell<UiContext>>, dx: f64) {
+    let mut inner = ctx.borrow_mut();
+    if let Some(idx) = active_section_index(&inner) {
+        let section = &mut inner.sections[idx];
+        section.scroll_x += dx;
+        apply_section_horizontal_scroll(section);
+    }
+}
+
+fn scroll_horizontal_at(ctx: &Rc<RefCell<UiContext>>, x: u16, y: u16, dx: f64) {
+    let mut inner = ctx.borrow_mut();
+    let idx = inner
+        .sections
+        .iter()
+        .position(|s| s.view.rect().contains(f64::from(x), f64::from(y)))
+        .or_else(|| active_section_index(&inner));
+    if let Some(idx) = idx {
+        let section = &mut inner.sections[idx];
+        section.scroll_x += dx;
+        apply_section_horizontal_scroll(section);
+    }
+}
+
+fn reset_horizontal_scroll(ctx: &Rc<RefCell<UiContext>>) {
+    let mut inner = ctx.borrow_mut();
+    if let Some(idx) = active_section_index(&inner) {
+        let section = &mut inner.sections[idx];
+        section.scroll_x = 0.0;
+        apply_section_horizontal_scroll(section);
+    }
+}
+
 fn scroll_to_file(ctx: &Rc<RefCell<UiContext>>, path: &str) {
-    let inner = ctx.borrow();
-    if let Some((_, view)) = inner.section_views.iter().find(|(p, _)| p == path) {
-        let target_y = f64::from(view.rect().top).max(0.0);
+    let mut inner = ctx.borrow_mut();
+    if let Some(idx) = inner.sections.iter().position(|s| s.path == path) {
+        let target_y = f64::from(inner.sections[idx].view.rect().top).max(0.0);
         inner.main_scroll.scroll_to(0.0, target_y);
+        let section = &mut inner.sections[idx];
+        section.scroll_x = 0.0;
+        apply_section_horizontal_scroll(section);
     }
 }
 
@@ -630,11 +839,11 @@ fn sync_active_file_from_scroll(ctx: &Rc<RefCell<UiContext>>) {
     let detected = {
         let inner = ctx.borrow();
         let viewport_top = inner.main_scroll.rect().screen_y;
-        let mut active: Option<String> = inner.section_views.first().map(|(p, _)| p.clone());
-        for (path, view) in &inner.section_views {
-            let rel_y = view.rect().screen_y - viewport_top;
+        let mut active: Option<String> = inner.sections.first().map(|s| s.path.clone());
+        for section in &inner.sections {
+            let rel_y = section.view.rect().screen_y - viewport_top;
             if rel_y <= 1.0 {
-                active = Some(path.clone());
+                active = Some(section.path.clone());
             } else {
                 break;
             }
@@ -1057,5 +1266,319 @@ mod tests {
         let screen = capture_text(&app.render());
         assert!(screen.contains("Reviewed (1)"));
         assert!(screen.contains("1/3 reviewed"));
+    }
+
+    #[test]
+    fn horizontal_scroll_keys_and_wheel_work_for_long_lines() {
+        let app = TestApp::with_options(
+            100,
+            20,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let long_line = format!("+START_MARKER_{}_END_MARKER", "x".repeat(140));
+        let files = vec![DiffFile {
+            path: "src/long.rs".to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_binary: false,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::HunkHeader,
+                    text: "@@ -1,1 +1,2 @@".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: long_line,
+                },
+            ],
+        }];
+        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
+        mount(&app, state, loader);
+
+        let initial = capture_text(&app.render());
+        assert!(initial.contains("START_MARKER"), "initial screen:\n{initial}");
+        assert!(!initial.contains("END_MARKER"), "initial screen should clip long line:\n{initial}");
+        assert!(
+            initial.contains("╭") && initial.contains("╮"),
+            "initial screen should show full rounded border:\n{initial}"
+        );
+
+        // Press 'l' enough times to scroll to the end of the line.
+        for _ in 0..40 {
+            app.press("l");
+        }
+        let scrolled_right = capture_text(&app.render());
+        assert!(
+            scrolled_right.contains("END_MARKER"),
+            "pressing 'l' should scroll right to END_MARKER:\n{scrolled_right}"
+        );
+        assert!(
+            !scrolled_right.contains("START_MARKER"),
+            "START_MARKER should be scrolled off left:\n{scrolled_right}"
+        );
+        // The file border and short header should remain fixed at the viewport width.
+        assert!(
+            scrolled_right.contains("╭") && scrolled_right.contains("╮"),
+            "border should stay fixed inside viewport when scrolled right:\n{scrolled_right}"
+        );
+        assert!(
+            scrolled_right.contains("│ M src/long.rs  +1"),
+            "short header should stay fixed inside border:\n{scrolled_right}"
+        );
+        assert!(
+            scrolled_right.contains("END_MARKER │"),
+            "scrolled text should stay inside the right border:\n{scrolled_right}"
+        );
+
+        // Press 'h' enough times to scroll back to the start.
+        for _ in 0..40 {
+            app.press("h");
+        }
+        let scrolled_left = capture_text(&app.render());
+        assert!(
+            scrolled_left.contains("START_MARKER"),
+            "pressing 'h' should scroll left back to START_MARKER:\n{scrolled_left}"
+        );
+
+        // Mouse horizontal scroll (ScrollRight) over the main panel should also work.
+        for _ in 0..120 {
+            app.mouse(MouseEventKind::ScrollRight, 60, 5);
+        }
+        let wheel_right = capture_text(&app.render());
+        assert!(
+            wheel_right.contains("END_MARKER"),
+            "mouse ScrollRight should scroll right to END_MARKER:\n{wheel_right}"
+        );
+        assert!(
+            wheel_right.contains("END_MARKER │"),
+            "right border and padding should remain intact:\n{wheel_right}"
+        );
+
+        // Mouse ScrollLeft should scroll back to the start.
+        for _ in 0..120 {
+            app.mouse(MouseEventKind::ScrollLeft, 60, 5);
+        }
+        let wheel_left = capture_text(&app.render());
+        assert!(
+            wheel_left.contains("START_MARKER"),
+            "mouse ScrollLeft should scroll back to START_MARKER:\n{wheel_left}"
+        );
+
+        // Shift + vertical wheel scroll should also scroll horizontally.
+        for _ in 0..120 {
+            app.event(opentui::input::Event::Mouse(opentui::input::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                x: 60,
+                y: 5,
+                modifiers: Modifiers::SHIFT,
+            }));
+        }
+        let shift_wheel = capture_text(&app.render());
+        assert!(
+            shift_wheel.contains("END_MARKER"),
+            "Shift+ScrollDown should scroll right to END_MARKER:\n{shift_wheel}"
+        );
+
+        // Arrow keys (left / right) should also scroll horizontally.
+        for _ in 0..40 {
+            app.press("left");
+        }
+        let arrow_left = capture_text(&app.render());
+        assert!(
+            arrow_left.contains("START_MARKER"),
+            "left arrow should scroll back to START_MARKER:\n{arrow_left}"
+        );
+        for _ in 0..40 {
+            app.press("right");
+        }
+        let arrow_right = capture_text(&app.render());
+        assert!(
+            arrow_right.contains("END_MARKER"),
+            "right arrow should scroll right to END_MARKER:\n{arrow_right}"
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_only_affects_current_or_hovered_file() {
+        let app = TestApp::with_options(
+            100,
+            24,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let alpha_long = format!("+ALPHA_START_{}_ALPHA_END", "a".repeat(120));
+        let beta_long = format!("+BETA_START_{}_BETA_END", "b".repeat(120));
+        let files = vec![
+            DiffFile {
+                path: "src/alpha.rs".to_owned(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                is_binary: false,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::HunkHeader,
+                        text: "@@ -1,1 +1,2 @@".to_owned(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        text: alpha_long,
+                    },
+                ],
+            },
+            DiffFile {
+                path: "src/beta.rs".to_owned(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                is_binary: false,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::HunkHeader,
+                        text: "@@ -1,1 +1,2 @@".to_owned(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        text: beta_long,
+                    },
+                ],
+            },
+        ];
+        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
+        mount(&app, state, loader);
+
+        let initial = capture_text(&app.render());
+        assert!(initial.contains("ALPHA_START"));
+        assert!(initial.contains("BETA_START"));
+
+        // Active file is alpha.rs: pressing 'l' should scroll only alpha.rs.
+        for _ in 0..40 {
+            app.press("l");
+        }
+        let after_l = capture_text(&app.render());
+        assert!(after_l.contains("ALPHA_END"), "alpha should scroll right:\n{after_l}");
+        assert!(!after_l.contains("ALPHA_START"), "alpha start should be scrolled off:\n{after_l}");
+        assert!(after_l.contains("BETA_START"), "beta should stay at column 0:\n{after_l}");
+        assert!(!after_l.contains("BETA_END"), "beta should not have scrolled:\n{after_l}");
+
+        // Mouse horizontal scroll over beta.rs should scroll only beta.rs.
+        let capture = app.render();
+        let beta_row = (0..capture.height)
+            .find(|&row| capture.row(row).contains("BETA_START"))
+            .expect("beta line should be visible") as u16;
+        for _ in 0..100 {
+            app.mouse(MouseEventKind::ScrollRight, 60, beta_row);
+        }
+        let after_mouse_beta = capture_text(&app.render());
+        assert!(
+            after_mouse_beta.contains("BETA_END"),
+            "scrolling over beta should scroll beta right:\n{after_mouse_beta}"
+        );
+        assert!(
+            after_mouse_beta.contains("ALPHA_END"),
+            "alpha should stay where it was:\n{after_mouse_beta}"
+        );
+    }
+
+    #[test]
+    fn axis_lock_suppresses_accidental_cross_axis_wheel_ticks() {
+        let app = TestApp::with_options(
+            100,
+            12,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let long_line = format!("+START_MARKER_{}_END_MARKER", "x".repeat(140));
+        let mut lines = vec![
+            DiffLine {
+                kind: DiffLineKind::HunkHeader,
+                text: "@@ -1,1 +1,20 @@".to_owned(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Added,
+                text: long_line,
+            },
+        ];
+        for i in 0..20 {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Added,
+                text: format!("+extra line {i}"),
+            });
+        }
+        let files = vec![DiffFile {
+            path: "src/long.rs".to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 21,
+            deletions: 0,
+            is_binary: false,
+            lines,
+        }];
+        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
+        mount(&app, state, loader);
+        let _ = app.render();
+
+        // A couple of stray horizontal ticks should be ignored by the deadzone.
+        app.mouse(MouseEventKind::ScrollRight, 60, 4);
+        app.mouse(MouseEventKind::ScrollRight, 60, 4);
+        let after_stray = capture_text(&app.render());
+        assert!(
+            after_stray.contains("│ +START_MARKER_"),
+            "stray ticks below deadzone should not scroll horizontally:\n{after_stray}"
+        );
+
+        // Horizontal ticks immediately following vertical scroll should be suppressed.
+        app.mouse(MouseEventKind::ScrollDown, 60, 4);
+        for _ in 0..10 {
+            app.mouse(MouseEventKind::ScrollRight, 60, 4);
+        }
+        let after_vertical_lock = capture_text(&app.render());
+        assert!(
+            after_vertical_lock.contains("│ +START_MARKER_"),
+            "horizontal ticks during vertical scroll lock should be ignored:\n{after_vertical_lock}"
+        );
+
+        // Scroll back to top, let lock expire, then perform an intentional horizontal swipe.
+        app.press("g");
+        let _ = app.render();
+        app.advance(Duration::from_millis(150));
+        for _ in 0..10 {
+            app.mouse(MouseEventKind::ScrollRight, 60, 4);
+        }
+        let after_swipe = capture_text(&app.render());
+        assert!(
+            !after_swipe.contains("│ +START_MARKER_"),
+            "intentional horizontal swipe after cooldown should scroll:\n{after_swipe}"
+        );
+        assert!(
+            after_swipe.contains("M src/long.rs"),
+            "header should still be visible at top before vertical scroll:\n{after_swipe}"
+        );
+
+        // Vertical ticks immediately following active horizontal scroll should be suppressed.
+        for _ in 0..10 {
+            app.mouse(MouseEventKind::ScrollDown, 60, 4);
+        }
+        let after_horizontal_lock = capture_text(&app.render());
+        assert!(
+            after_horizontal_lock.contains("M src/long.rs"),
+            "vertical ticks during horizontal scroll lock should be ignored:\n{after_horizontal_lock}"
+        );
+
+        // After the horizontal-scroll lock expires, vertical scrolling should work again.
+        app.advance(Duration::from_millis(150));
+        for _ in 0..10 {
+            app.mouse(MouseEventKind::ScrollDown, 60, 4);
+        }
+        let after_vertical_resume = capture_text(&app.render());
+        assert!(
+            !after_vertical_resume.contains("M src/long.rs"),
+            "vertical scroll should resume after axis lock expires:\n{after_vertical_resume}"
+        );
     }
 }
