@@ -86,7 +86,7 @@ review --help
 - **Changed files**: Click a file in the side panel to jump to its diff.
 - **Directories**: Click a directory row to collapse or expand it.
 - **Reviewed files**: Click a reviewed file in the side panel to un-review it and jump back to it.
-- **Footer bar**: Click `^p panel`, `^z wrap`, `^w ws`, `^u untracked`, or `r review` to trigger the corresponding action.
+- **Footer bar**: Click `r review`, `^p panel`, `^z wrap`, `^w ws`, or `^u untracked` to trigger the corresponding action.
 
 ## Development
 

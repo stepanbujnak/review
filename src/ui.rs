@@ -164,11 +164,11 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         .row()
         .gap(1)
         .shrink(0.0)
+        .child(&btn_review)
         .child(&btn_panel)
         .child(&btn_wrap)
         .child(&btn_ws)
-        .child(&btn_untracked)
-        .child(&btn_review);
+        .child(&btn_untracked);
 
     let footer_status = Text::new(app, "")
         .fg(Color::BRIGHT_BLACK)
@@ -1286,8 +1286,12 @@ mod tests {
         let footer_y = (capture.height - 1) as u16;
         let footer_row = capture.row(capture.height - 1);
 
-        // Panel button is at the left of the footer.
-        let panel_x = footer_row.find(" ^p panel:on ").expect("panel button") as u16 + 2;
+        // Review button is first (leftmost) in the footer.
+        let review_pos = footer_row.find(" r review ").expect("review button");
+        let panel_pos = footer_row.find(" ^p panel:on ").expect("panel button");
+        assert!(review_pos < panel_pos, "review button should be first in footer: {footer_row}");
+
+        let panel_x = panel_pos as u16 + 2;
         app.click(panel_x, footer_y);
         let screen = capture_text(&app.render());
         assert!(!screen.contains("Changed (3)"));
