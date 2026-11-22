@@ -75,6 +75,7 @@ impl WheelAxisFilter {
 }
 
 pub type DiffLoader = Rc<dyn Fn(&DiffOptions) -> std::result::Result<Vec<DiffFile>, String>>;
+pub type FileOpener = Rc<dyn Fn(&str) -> std::result::Result<(), String>>;
 
 struct SideFileRow {
     widget: Text,
@@ -97,15 +98,19 @@ struct UiContext {
     app: App,
     state: AppState,
     loader: DiffLoader,
+    opener: FileOpener,
     side_panel: View,
     side_scroll: ScrollBox,
     main_scroll: ScrollBox,
-    btn_panel: Text,
-    btn_ws: Text,
-    btn_untracked: Text,
-    btn_wrap: Text,
+    btn_files: Text,
+    btn_config: Text,
     btn_review: Text,
+    btn_edit: Text,
     footer_status: Text,
+    config_overlay: View,
+    config_rows: [Text; 3],
+    config_open: bool,
+    config_selected: usize,
     /// Ordered list of file sections currently mounted in `main_scroll`.
     sections: Vec<FileSection>,
     /// Filters accidental diagonal cross-axis trackpad ticks while scrolling.
@@ -119,7 +124,7 @@ struct UiContext {
 }
 
 /// Mounts the complete reviewer UI onto `app.root()` and binds all keyboard/mouse handlers.
-pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
+pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: FileOpener) {
     let root = app.root();
     root.column();
 
@@ -154,21 +159,19 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
     body.add(&side_panel);
     body.add(&main_scroll);
 
-    let btn_panel = make_footer_button(app);
-    let btn_ws = make_footer_button(app);
-    let btn_untracked = make_footer_button(app);
-    let btn_wrap = make_footer_button(app);
+    let btn_files = make_footer_button(app);
+    let btn_config = make_footer_button(app);
     let btn_review = make_footer_button(app);
+    let btn_edit = make_footer_button(app);
 
     let footer_buttons = View::new(app)
         .row()
         .gap(1)
         .shrink(0.0)
         .child(&btn_review)
-        .child(&btn_panel)
-        .child(&btn_wrap)
-        .child(&btn_ws)
-        .child(&btn_untracked);
+        .child(&btn_edit)
+        .child(&btn_files)
+        .child(&btn_config);
 
     let footer_status = Text::new(app, "")
         .fg(Color::BRIGHT_BLACK)
@@ -187,22 +190,63 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
         .child(&footer_buttons)
         .child(&footer_status);
 
+    let cfg_wrap = make_config_row_widget(app);
+    let cfg_ws = make_config_row_widget(app);
+    let cfg_untracked = make_config_row_widget(app);
+    let cfg_hint = Text::new(app, " ↑/↓ move · space toggle · esc ")
+        .fg(Color::BRIGHT_BLACK)
+        .selectable(false);
+
+    let config_options = View::new(app)
+        .column()
+        .child(&cfg_wrap)
+        .child(&cfg_ws)
+        .child(&cfg_untracked);
+
+    let config_dialog = View::new(app)
+        .column()
+        .width(40)
+        .border(BorderStyle::Rounded)
+        .border_color(Color::CYAN)
+        .title(" Config ")
+        .title_color(Color::DEFAULT_FOREGROUND)
+        .bg(Color::DEFAULT_BACKGROUND)
+        .padding_x(2)
+        .padding_y(1)
+        .gap(1)
+        .child(&config_options)
+        .child(&cfg_hint);
+
+    let config_overlay = View::new(app)
+        .absolute()
+        .position(Edge::All, 0)
+        .z_index(10)
+        .justify(Justify::Center)
+        .align_items(Align::Center)
+        .visible(false)
+        .child(&config_dialog);
+
     root.add(&body);
     root.add(&footer);
+    root.add(&config_overlay);
 
     let ctx = Rc::new(RefCell::new(UiContext {
         app: app.clone(),
         state: initial_state,
         loader,
+        opener,
         side_panel,
         side_scroll,
         main_scroll: main_scroll.clone(),
-        btn_panel: btn_panel.clone(),
-        btn_ws: btn_ws.clone(),
-        btn_untracked: btn_untracked.clone(),
-        btn_wrap: btn_wrap.clone(),
+        btn_files: btn_files.clone(),
+        btn_config: btn_config.clone(),
         btn_review: btn_review.clone(),
+        btn_edit: btn_edit.clone(),
         footer_status,
+        config_overlay: config_overlay.clone(),
+        config_rows: [cfg_wrap.clone(), cfg_ws.clone(), cfg_untracked.clone()],
+        config_open: false,
+        config_selected: 0,
         sections: Vec::new(),
         wheel_filter: WheelAxisFilter::default(),
         side_file_widgets: HashMap::new(),
@@ -216,23 +260,51 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader) {
     // Wire footer toggle/action buttons.
     {
         let ctx_btn = Rc::clone(&ctx);
-        btn_panel.on_click(move |_cx, _ev| toggle_side_panel(&ctx_btn));
+        btn_files.on_click(move |_cx, _ev| toggle_side_panel(&ctx_btn));
     }
     {
         let ctx_btn = Rc::clone(&ctx);
-        btn_ws.on_click(move |_cx, _ev| toggle_whitespace(&ctx_btn));
-    }
-    {
-        let ctx_btn = Rc::clone(&ctx);
-        btn_untracked.on_click(move |_cx, _ev| toggle_untracked(&ctx_btn));
-    }
-    {
-        let ctx_btn = Rc::clone(&ctx);
-        btn_wrap.on_click(move |_cx, _ev| toggle_wrap(&ctx_btn));
+        btn_config.on_click(move |_cx, _ev| toggle_config_modal(&ctx_btn));
     }
     {
         let ctx_btn = Rc::clone(&ctx);
         btn_review.on_click(move |_cx, _ev| mark_current_reviewed(&ctx_btn));
+    }
+    {
+        let ctx_btn = Rc::clone(&ctx);
+        btn_edit.on_click(move |_cx, _ev| edit_current_file(&ctx_btn));
+    }
+
+    // Wire config modal options and backdrop click-to-close.
+    {
+        let ctx_row = Rc::clone(&ctx);
+        cfg_wrap.on_click(move |_cx, _ev| {
+            ctx_row.borrow_mut().config_selected = 0;
+            toggle_wrap(&ctx_row);
+        });
+    }
+    {
+        let ctx_row = Rc::clone(&ctx);
+        cfg_ws.on_click(move |_cx, _ev| {
+            ctx_row.borrow_mut().config_selected = 1;
+            toggle_whitespace(&ctx_row);
+        });
+    }
+    {
+        let ctx_row = Rc::clone(&ctx);
+        cfg_untracked.on_click(move |_cx, _ev| {
+            ctx_row.borrow_mut().config_selected = 2;
+            toggle_untracked(&ctx_row);
+        });
+    }
+    {
+        let ctx_bg = Rc::clone(&ctx);
+        let dialog_ref = config_dialog.clone();
+        config_overlay.on_click(move |_cx, ev| {
+            if !dialog_ref.rect().contains(f64::from(ev.x), f64::from(ev.y)) {
+                set_config_open(&ctx_bg, false);
+            }
+        });
     }
 
     // Track currently viewed file as the user scrolls the main diff panel.
@@ -314,6 +386,37 @@ fn make_footer_button(app: &App) -> Text {
         .mouse_pointer(MousePointer::POINTER)
 }
 
+fn make_config_row_widget(app: &App) -> Text {
+    Text::new(app, "")
+        .selectable(false)
+        .mouse_pointer(MousePointer::POINTER)
+}
+
+fn set_config_open(ctx: &Rc<RefCell<UiContext>>, open: bool) {
+    let mut inner = ctx.borrow_mut();
+    if inner.config_open == open {
+        return;
+    }
+    inner.config_open = open;
+    inner.config_overlay.visible(open);
+    update_footer(&inner);
+    update_config_modal(&inner);
+}
+
+fn toggle_config_modal(ctx: &Rc<RefCell<UiContext>>) {
+    let open = !ctx.borrow().config_open;
+    set_config_open(ctx, open);
+}
+
+fn toggle_selected_config(ctx: &Rc<RefCell<UiContext>>) {
+    let selected = ctx.borrow().config_selected;
+    match selected {
+        0 => toggle_wrap(ctx),
+        1 => toggle_whitespace(ctx),
+        _ => toggle_untracked(ctx),
+    }
+}
+
 fn toggle_side_panel(ctx: &Rc<RefCell<UiContext>>) {
     let mut inner = ctx.borrow_mut();
     inner.state.hide_side_panel = !inner.state.hide_side_panel;
@@ -374,14 +477,49 @@ fn mark_current_reviewed(ctx: &Rc<RefCell<UiContext>>) {
     }
 }
 
+fn edit_current_file(ctx: &Rc<RefCell<UiContext>>) {
+    let (app, opener, path) = {
+        let inner = ctx.borrow();
+        let Some(path) = inner.state.active_file.clone() else {
+            return;
+        };
+        (inner.app.clone(), Rc::clone(&inner.opener), path)
+    };
+
+    let ctx_after = Rc::clone(ctx);
+    app.release_terminal(move |_cx| match opener(&path) {
+        Ok(()) => reload_from_git(&ctx_after),
+        Err(err) => {
+            let mut inner = ctx_after.borrow_mut();
+            inner.last_error = Some(err);
+            update_footer(&inner);
+        }
+    });
+}
+
 fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
-    if key.matches("q") || key.matches("ctrl+c") {
+    if key.matches("ctrl+c") {
         cx.quit();
         return;
     }
 
-    if key.matches("ctrl+p") {
+    if ctx.borrow().config_open {
+        handle_config_modal_key(key, ctx);
+        return;
+    }
+
+    if key.matches("q") {
+        cx.quit();
+        return;
+    }
+
+    if key.matches("f") {
         toggle_side_panel(ctx);
+        return;
+    }
+
+    if key.matches("c") {
+        toggle_config_modal(ctx);
         return;
     }
 
@@ -402,6 +540,11 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
 
     if key.matches("r") {
         mark_current_reviewed(ctx);
+        return;
+    }
+
+    if key.matches("e") {
+        edit_current_file(ctx);
         return;
     }
 
@@ -455,6 +598,50 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
     } else if key.matches("G") || key.matches("end") {
         main.scroll_to_bottom();
         sync_active_file_from_scroll(ctx);
+    }
+}
+
+fn handle_config_modal_key(key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
+    if key.matches("escape") || key.matches("c") || key.matches("q") {
+        set_config_open(ctx, false);
+        return;
+    }
+
+    if key.matches("j") || key.matches("down") {
+        let mut inner = ctx.borrow_mut();
+        inner.config_selected = (inner.config_selected + 1) % inner.config_rows.len();
+        update_config_modal(&inner);
+        return;
+    }
+
+    if key.matches("k") || key.matches("up") {
+        let mut inner = ctx.borrow_mut();
+        let len = inner.config_rows.len();
+        inner.config_selected = (inner.config_selected + len - 1) % len;
+        update_config_modal(&inner);
+        return;
+    }
+
+    if key.matches("enter") || key.matches("space") {
+        toggle_selected_config(ctx);
+        return;
+    }
+
+    if key.matches("z") || key.matches("ctrl+z") {
+        ctx.borrow_mut().config_selected = 0;
+        toggle_wrap(ctx);
+        return;
+    }
+
+    if key.matches("w") || key.matches("ctrl+w") {
+        ctx.borrow_mut().config_selected = 1;
+        toggle_whitespace(ctx);
+        return;
+    }
+
+    if key.matches("u") || key.matches("ctrl+u") {
+        ctx.borrow_mut().config_selected = 2;
+        toggle_untracked(ctx);
     }
 }
 
@@ -681,7 +868,7 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
         let message = if total == 0 {
             "No git changes."
         } else {
-            "All files marked as reviewed. Open side panel (ctrl+p) to un-review."
+            "All files marked as reviewed. Open files panel (f) to un-review."
         };
         let empty = View::new(&app)
             .padding(2)
@@ -945,32 +1132,53 @@ fn style_toggle_button(button: &Text, label: &str, active: bool) {
     }
 }
 
-fn update_footer(inner: &UiContext) {
-    let panel_on = !inner.state.hide_side_panel;
-    let ws_on = !inner.state.hide_whitespace;
-    let untracked_on = !inner.state.hide_untracked;
-    let wrap_on = inner.state.wrap_lines;
+fn format_config_row(label: &str, shortcut: &str, enabled: bool, selected: bool) -> Vec<Span<'static>> {
+    let check = if enabled { "[x]" } else { "[ ]" };
+    if selected {
+        vec![Span::styled(
+            format!(" {check} {label:<20} ({shortcut}) "),
+            Style::new().fg(Color::DEFAULT_FOREGROUND).bold().inverse(),
+        )]
+    } else {
+        vec![
+            Span::styled(
+                format!(" {check} "),
+                Style::new().fg(if enabled {
+                    Color::GREEN
+                } else {
+                    Color::BRIGHT_BLACK
+                }),
+            ),
+            Span::styled(
+                format!("{label:<20} "),
+                Style::new().fg(Color::DEFAULT_FOREGROUND),
+            ),
+            Span::styled(format!("({shortcut}) "), Style::new().fg(Color::BRIGHT_BLACK)),
+        ]
+    }
+}
 
-    style_toggle_button(
-        &inner.btn_panel,
-        &format!("^p panel:{}", if panel_on { "on" } else { "off" }),
-        panel_on,
-    );
-    style_toggle_button(
-        &inner.btn_ws,
-        &format!("^w ws:{}", if ws_on { "on" } else { "off" }),
-        ws_on,
-    );
-    style_toggle_button(
-        &inner.btn_untracked,
-        &format!("^u untracked:{}", if untracked_on { "on" } else { "off" }),
-        untracked_on,
-    );
-    style_toggle_button(
-        &inner.btn_wrap,
-        &format!("^z wrap:{}", if wrap_on { "on" } else { "off" }),
-        wrap_on,
-    );
+fn update_config_modal(inner: &UiContext) {
+    let items = [
+        ("Wrap lines", "^z", inner.state.wrap_lines),
+        ("Whitespace changes", "^w", !inner.state.hide_whitespace),
+        ("Untracked files", "^u", !inner.state.hide_untracked),
+    ];
+    for (idx, (label, shortcut, enabled)) in items.into_iter().enumerate() {
+        inner.config_rows[idx].set_text(format_config_row(
+            label,
+            shortcut,
+            enabled,
+            idx == inner.config_selected,
+        ));
+    }
+}
+
+fn update_footer(inner: &UiContext) {
+    let files_on = !inner.state.hide_side_panel;
+
+    style_toggle_button(&inner.btn_files, "f files", files_on);
+    style_toggle_button(&inner.btn_config, "c config", inner.config_open);
 
     if inner.state.active_file.is_some() {
         inner
@@ -979,10 +1187,22 @@ fn update_footer(inner: &UiContext) {
             .fg(Color::BLACK)
             .bg(Color::GREEN)
             .attributes(Attributes::BOLD);
+        inner
+            .btn_edit
+            .set_text(" e edit ")
+            .fg(Color::BLACK)
+            .bg(Color::CYAN)
+            .attributes(Attributes::BOLD);
     } else {
         inner
             .btn_review
             .set_text(" r review ")
+            .fg(Color::WHITE)
+            .bg(Color::BRIGHT_BLACK)
+            .attributes(Attributes::DIM);
+        inner
+            .btn_edit
+            .set_text(" e edit ")
             .fg(Color::WHITE)
             .bg(Color::BRIGHT_BLACK)
             .attributes(Attributes::DIM);
@@ -1000,6 +1220,8 @@ fn update_footer(inner: &UiContext) {
             ))
             .fg(Color::BRIGHT_BLACK);
     }
+
+    update_config_modal(inner);
 }
 
 #[cfg(test)]
@@ -1093,6 +1315,10 @@ mod tests {
             .join("\n")
     }
 
+    fn noop_opener() -> FileOpener {
+        Rc::new(|_path| Ok(()))
+    }
+
     fn setup_test_app() -> TestApp {
         let app = TestApp::with_options(
             120,
@@ -1101,7 +1327,7 @@ mod tests {
         );
         let state = AppState::new(sample_files(&DiffOptions::default()), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(|opts| Ok(sample_files(opts)));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
         app
     }
 
@@ -1115,11 +1341,11 @@ mod tests {
         assert!(screen.contains("untracked.txt"));
         assert!(!screen.contains("ws_only.txt"));
 
-        // ctrl+p hides side panel, and pressing again restores it.
-        app.press("ctrl+p");
+        // 'f' hides files panel, and pressing again restores it.
+        app.press("f");
         let screen = capture_text(&app.render());
         assert!(!screen.contains("Changed (3)"));
-        app.press("ctrl+p");
+        app.press("f");
         let screen = capture_text(&app.render());
         assert!(screen.contains("Changed (3)"));
 
@@ -1262,7 +1488,7 @@ mod tests {
 
         let state = AppState::new(make_tall_files(&DiffOptions::default()), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(move |opts| Ok(make_tall_files(opts)));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
         let _ = app.render();
 
         // Jump to second file (src/beta.rs), which is well below the first viewport.
@@ -1280,49 +1506,70 @@ mod tests {
     }
 
     #[test]
-    fn clicking_footer_buttons_toggles_panel_whitespace_untracked_and_review() {
+    fn clicking_footer_buttons_and_config_modal_works() {
         let app = setup_test_app();
         let capture = app.render();
         let footer_y = (capture.height - 1) as u16;
         let footer_row = capture.row(capture.height - 1);
 
-        // Review button is first (leftmost) in the footer.
+        // Footer shows compact buttons: r review, e edit, f files, c config.
         let review_pos = footer_row.find(" r review ").expect("review button");
-        let panel_pos = footer_row.find(" ^p panel:on ").expect("panel button");
-        assert!(review_pos < panel_pos, "review button should be first in footer: {footer_row}");
+        let edit_pos = footer_row.find(" e edit ").expect("edit button");
+        let files_pos = footer_row.find(" f files ").expect("files button");
+        let config_pos = footer_row.find(" c config ").expect("config button");
+        assert!(review_pos < edit_pos && edit_pos < files_pos && files_pos < config_pos);
+        assert!(!footer_row.contains("^w ws"));
+        assert!(!footer_row.contains("^u untracked"));
+        assert!(!footer_row.contains("^z wrap"));
 
-        let panel_x = panel_pos as u16 + 2;
-        app.click(panel_x, footer_y);
+        // Click files button to hide, then click again to restore.
+        let files_x = files_pos as u16 + 2;
+        app.click(files_x, footer_y);
         let screen = capture_text(&app.render());
         assert!(!screen.contains("Changed (3)"));
-        assert!(screen.contains(" ^p panel:off "));
+        app.click(files_x, footer_y);
+        let screen = capture_text(&app.render());
+        assert!(screen.contains("Changed (3)"));
 
-        // Click again to bring side panel back.
-        app.click(panel_x, footer_y);
-        let capture = app.render();
-        let footer_row = capture.row(capture.height - 1);
-        assert!(footer_row.contains(" ^p panel:on "));
-
-        // Click whitespace button.
-        let ws_x = footer_row.find(" ^w ws:off ").expect("ws button") as u16 + 2;
-        app.click(ws_x, footer_y);
+        // Click config button to open the modal.
+        let config_x = config_pos as u16 + 2;
+        app.click(config_x, footer_y);
         let capture = app.render();
         let screen = capture_text(&capture);
+        assert!(screen.contains("Config"), "config modal should open:\n{screen}");
+        assert!(screen.contains("[ ] Wrap lines"));
+        assert!(screen.contains("[ ] Whitespace changes"));
+        assert!(screen.contains("[x] Untracked files"));
+
+        // Click Whitespace changes inside the modal.
+        let ws_row = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Whitespace changes"))
+            .expect("whitespace row in config modal");
+        let ws_x = capture.row(ws_row).find("Whitespace changes").unwrap() as u16 + 2;
+        app.click(ws_x, ws_row as u16);
+        let capture = app.render();
+        let screen = capture_text(&capture);
+        assert!(screen.contains("[x] Whitespace changes"));
         assert!(screen.contains("ws_only.txt"));
-        assert!(screen.contains(" ^w ws:on "));
 
-        // Click untracked button.
-        let footer_row = capture.row(capture.height - 1);
-        let untracked_x = footer_row.find(" ^u untracked:on ").expect("untracked button") as u16 + 2;
-        app.click(untracked_x, footer_y);
+        // Click Untracked files inside the modal.
+        let untracked_row = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Untracked files"))
+            .expect("untracked row in config modal");
+        let untracked_x = capture.row(untracked_row).find("Untracked files").unwrap() as u16 + 2;
+        app.click(untracked_x, untracked_row as u16);
         let capture = app.render();
         let screen = capture_text(&capture);
+        assert!(screen.contains("[ ] Untracked files"));
         assert!(!screen.contains("untracked.txt"));
-        assert!(screen.contains(" ^u untracked:off "));
+
+        // Click outside the modal to close it.
+        app.click(1, 1);
+        let screen = capture_text(&app.render());
+        assert!(!screen.contains("Whitespace changes"));
 
         // Click review button.
-        let footer_row = capture.row(capture.height - 1);
-        let review_x = footer_row.find(" r review ").expect("review button") as u16 + 2;
+        let review_x = review_pos as u16 + 2;
         app.click(review_x, footer_y);
         let screen = capture_text(&app.render());
         assert!(screen.contains("Reviewed (1)"));
@@ -1357,7 +1604,7 @@ mod tests {
         }];
         let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
 
         let initial = capture_text(&app.render());
         assert!(initial.contains("START_MARKER"), "initial screen:\n{initial}");
@@ -1511,7 +1758,7 @@ mod tests {
         ];
         let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
 
         let initial = capture_text(&app.render());
         assert!(initial.contains("ALPHA_START"));
@@ -1581,7 +1828,7 @@ mod tests {
         }];
         let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
         let _ = app.render();
 
         // A couple of stray horizontal ticks should be ignored by the deadzone.
@@ -1671,13 +1918,12 @@ mod tests {
         }];
         let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
         let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader);
+        mount(&app, state, loader, noop_opener());
 
         // Wrap is off by default: long line is clipped.
         let initial = capture_text(&app.render());
         assert!(initial.contains("START_MARKER"));
         assert!(!initial.contains("END_MARKER"));
-        assert!(initial.contains(" ^z wrap:off "));
 
         // Scroll horizontally first, then toggle wrap on with ctrl+z:
         // horizontal offset should reset and both START_MARKER and END_MARKER should be visible.
@@ -1687,26 +1933,157 @@ mod tests {
         app.press("ctrl+z");
         let wrapped = capture_text(&app.render());
         assert!(
-            wrapped.contains(" ^z wrap:on "),
-            "footer should show wrap:on:\n{wrapped}"
-        );
-        assert!(
             wrapped.contains("START_MARKER") && wrapped.contains("END_MARKER"),
             "wrapped view should show both start and end of long line:\n{wrapped}"
         );
 
-        // Clicking the wrap button in the footer toggles wrap back off.
+        // Open config modal via 'c', toggle Wrap lines off with space, and close with escape.
+        app.press("c");
+        let modal = capture_text(&app.render());
+        assert!(modal.contains("[x] Wrap lines"), "modal should reflect wrap=on:\n{modal}");
+        app.press("space");
+        let modal_after = capture_text(&app.render());
+        assert!(modal_after.contains("[ ] Wrap lines"));
+        app.press("escape");
+
+        let unwrapped = capture_text(&app.render());
+        assert!(!unwrapped.contains("Wrap lines"));
+        assert!(unwrapped.contains("START_MARKER"));
+        assert!(!unwrapped.contains("END_MARKER"));
+    }
+
+    #[test]
+    fn config_modal_keyboard_navigation_and_isolation() {
+        let app = setup_test_app();
+        let _ = app.render();
+
+        // Open config modal with 'c'.
+        app.press("c");
+        let modal = capture_text(&app.render());
+        assert!(modal.contains("[ ] Wrap lines"));
+        assert!(modal.contains("[ ] Whitespace changes"));
+        assert!(modal.contains("[x] Untracked files"));
+
+        // Pressing 'r' while modal is open should NOT mark a file as reviewed.
+        app.press("r");
+        let after_r = capture_text(&app.render());
+        assert!(after_r.contains("0/3 reviewed"));
+
+        // Move down to Whitespace changes and toggle with enter.
+        app.press("j");
+        app.press("enter");
+        let after_ws = capture_text(&app.render());
+        assert!(after_ws.contains("[x] Whitespace changes"));
+        assert!(after_ws.contains("ws_only.txt"));
+
+        // Move down to Untracked files and toggle with space.
+        app.press("down");
+        app.press("space");
+        let after_u = capture_text(&app.render());
+        assert!(after_u.contains("[ ] Untracked files"));
+        assert!(!after_u.contains("untracked.txt"));
+
+        // Close modal with 'c'.
+        app.press("c");
+        let closed = capture_text(&app.render());
+        assert!(!closed.contains("Whitespace changes"));
+    }
+
+    #[test]
+    fn edit_shortcut_and_footer_button_open_active_file_and_reload() {
+        let app = TestApp::with_options(
+            120,
+            30,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let edited_marker = Rc::new(std::cell::Cell::new(false));
+
+        let edited_for_loader = Rc::clone(&edited_marker);
+        let loader: DiffLoader = Rc::new(move |opts| {
+            let mut files = sample_files(opts);
+            if edited_for_loader.get()
+                && let Some(alpha) = files.iter_mut().find(|f| f.path == "src/alpha.rs")
+            {
+                alpha.lines.push(DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: "+edited in $EDITOR".to_owned(),
+                });
+            }
+            Ok(files)
+        });
+
+        let opened_for_cb = Rc::clone(&opened);
+        let edited_for_cb = Rc::clone(&edited_marker);
+        let opener: FileOpener = Rc::new(move |path| {
+            opened_for_cb.borrow_mut().push(path.to_owned());
+            edited_for_cb.set(true);
+            Ok(())
+        });
+
+        let state = AppState::new(sample_files(&DiffOptions::default()), DiffTarget::WorkingTree);
+        mount(&app, state, loader, opener);
+
         let capture = app.render();
         let footer_y = (capture.height - 1) as u16;
         let footer_row = capture.row(capture.height - 1);
-        let wrap_x = footer_row.find(" ^z wrap:on ").expect("wrap button") as u16 + 2;
-        app.click(wrap_x, footer_y);
-        let unwrapped = capture_text(&app.render());
-        assert!(
-            unwrapped.contains(" ^z wrap:off "),
-            "footer should show wrap:off:\n{unwrapped}"
+        assert!(footer_row.contains(" e edit "), "footer should show edit button: {footer_row}");
+
+        // Press 'e' to edit active file (src/alpha.rs); diff reloads with the updated line.
+        app.press("e");
+        let after_key = capture_text(&app.render());
+        assert_eq!(*opened.borrow(), vec!["src/alpha.rs"]);
+        assert!(after_key.contains("+edited in $EDITOR"));
+
+        // Move to src/beta.rs and click the footer edit button.
+        app.press("n");
+        let capture = app.render();
+        let footer_row = capture.row(capture.height - 1);
+        let edit_x = footer_row.find(" e edit ").expect("edit button") as u16 + 2;
+        app.click(edit_x, footer_y);
+        let _ = app.render();
+        assert_eq!(*opened.borrow(), vec!["src/alpha.rs", "src/beta.rs"]);
+    }
+
+    #[test]
+    fn edit_error_is_shown_in_footer_and_noop_when_no_active_file() {
+        let app = TestApp::with_options(
+            120,
+            30,
+            AppOptions::default().with_theme(Theme::terminal()),
         );
-        assert!(unwrapped.contains("START_MARKER"));
-        assert!(!unwrapped.contains("END_MARKER"));
+        let calls = Rc::new(std::cell::Cell::new(0usize));
+        let calls_cb = Rc::clone(&calls);
+        let opener: FileOpener = Rc::new(move |_path| {
+            calls_cb.set(calls_cb.get() + 1);
+            Err("$EDITOR is not set".to_owned())
+        });
+        let files = vec![DiffFile {
+            path: "only.rs".to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            is_binary: false,
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Added,
+                text: "+line".to_owned(),
+            }],
+        }];
+        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
+        mount(&app, state, loader, opener);
+
+        app.press("e");
+        let screen = capture_text(&app.render());
+        assert_eq!(calls.get(), 1);
+        assert!(screen.contains("error: $EDITOR is not set"));
+
+        // Mark the only file as reviewed so active_file is None; pressing 'e' does nothing.
+        app.press("r");
+        let _ = app.render();
+        app.press("e");
+        let _ = app.render();
+        assert_eq!(calls.get(), 1);
     }
 }

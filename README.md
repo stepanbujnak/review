@@ -7,7 +7,7 @@ A minimal terminal UI utility for reviewing Git changes, built with Rust and [Op
 - **Continuous diff view** — Browse all unreviewed changes in a single scrollable view with color-coded unified diffs, rename detection (`-M`), and untracked file previews (up to 2 MiB).
 - **Interactive file tree** — Collapsible directory tree in the side panel with status badges (`M`, `A`, `D`, `R`, `?`), synced with your current scroll position.
 - **Review workflow** — Mark files as reviewed to move them out of the main diff view and automatically advance to the next unreviewed file. Click any reviewed file in the side panel to bring it back.
-- **Sensible defaults, instant toggles** — Side panel shown, whitespace changes hidden (`git diff -w`), and untracked files included by default. Toggle any of them on the fly via keyboard or clickable footer buttons.
+- **Sensible defaults, instant toggles** — Files panel shown, whitespace changes hidden (`git diff -w`), and untracked files included by default. Toggle any of them on the fly via keyboard shortcuts or the `c config` modal.
 - **Flexible diff targets** — Review working tree changes (including repositories with no commits yet), staged changes, or any `git diff` revision/range.
 - **Live reload** — Reload diffs from Git without losing your reviewed-files checklist.
 
@@ -66,11 +66,13 @@ review --help
 
 | Key | Action |
 | --- | --- |
-| `ctrl+p` | Toggle side panel (shown by default) |
+| `f` | Toggle files panel (shown by default) |
+| `c` | Open config modal (wrap, whitespace, untracked) |
 | `ctrl+w` | Toggle whitespace changes (hidden by default) |
 | `ctrl+u` | Toggle untracked files (shown by default) |
 | `ctrl+z` | Toggle line wrapping (off by default) |
 | `r` | Mark currently viewed file as reviewed |
+| `e` | Edit currently viewed file in `$EDITOR` |
 | `n` / `p` | Jump to next / previous unreviewed file |
 | `j` / `k` or `↓` / `↑` | Scroll down / up |
 | `h` / `l` or `←` / `→` | Scroll left / right |
@@ -86,7 +88,8 @@ review --help
 - **Changed files**: Click a file in the side panel to jump to its diff.
 - **Directories**: Click a directory row to collapse or expand it.
 - **Reviewed files**: Click a reviewed file in the side panel to un-review it and jump back to it.
-- **Footer bar**: Click `r review`, `^p panel`, `^z wrap`, `^w ws`, or `^u untracked` to trigger the corresponding action.
+- **Footer bar**: Click `r review`, `e edit`, `f files`, or `c config` to trigger the corresponding action.
+- **Config modal**: Click any option (`Wrap lines`, `Whitespace changes`, `Untracked files`) to toggle it, or click outside the modal to close it.
 
 ## Development
 

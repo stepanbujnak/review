@@ -7,6 +7,7 @@ use crate::git::{DiffTarget, load_diff, repo_root};
 use crate::state::AppState;
 use opentui::prelude::*;
 use std::env;
+use std::path::Path;
 use std::process;
 use std::rc::Rc;
 
@@ -36,11 +37,13 @@ OPTIONS:
     -h, --help            Show this help message
 
 KEYBINDINGS:
-    ctrl+p                Toggle side panel (shown by default)
+    f                     Toggle files panel (shown by default)
+    c                     Open config modal (wrap, whitespace, untracked)
     ctrl+w                Toggle whitespace changes (hidden by default)
     ctrl+u                Toggle untracked files (shown by default)
     ctrl+z                Toggle line wrapping (off by default)
     r                     Mark currently viewed file as reviewed
+    e                     Edit currently viewed file in $EDITOR
     n / p                 Next / previous unreviewed file
     j / k / h / l         Scroll down / up / left / right
     PageUp / PageDown     Scroll half a page
@@ -96,12 +99,78 @@ fn main() {
 
     let loader_root = root.clone();
     let loader: ui::DiffLoader = Rc::new(move |opts| load_diff(&loader_root, opts));
+    let opener_root = root.clone();
+    let opener: ui::FileOpener = Rc::new(move |rel_path| open_in_editor(&opener_root, rel_path));
     let initial_state = AppState::new(files, target);
 
-    ui::mount(&app, initial_state, loader);
+    ui::mount(&app, initial_state, loader, opener);
 
     if let Err(err) = app.run() {
         eprintln!("error: {err}");
         process::exit(1);
+    }
+}
+
+fn resolve_editor() -> Result<String, String> {
+    env::var("EDITOR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env::var("VISUAL").ok().filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| "$EDITOR is not set".to_owned())
+}
+
+fn run_editor(editor: &str, repo_root: &Path, rel_path: &str) -> Result<(), String> {
+    let full_path = repo_root.join(rel_path);
+    let status = process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("--")
+        .arg(&full_path)
+        .current_dir(repo_root)
+        .status()
+        .map_err(|err| format!("failed to launch editor: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        match status.code() {
+            Some(code) => Err(format!("editor exited with status {code}")),
+            None => Err("editor terminated by signal".to_owned()),
+        }
+    }
+}
+
+fn open_in_editor(repo_root: &Path, rel_path: &str) -> Result<(), String> {
+    let editor = resolve_editor()?;
+    run_editor(&editor, repo_root, rel_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn run_editor_passes_full_path_and_supports_arguments() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("review-editor-test-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("hello world.txt");
+        fs::write(&target, "before\n").unwrap();
+
+        // Simulate an $EDITOR with flags that modifies the file passed as "$1".
+        run_editor("sh -c 'echo edited >> \"$1\"' --", &dir, "hello world.txt").unwrap();
+        let content = fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "before\nedited\n");
+
+        // Non-zero exit status is reported as an error.
+        let err = run_editor("false", &dir, "hello world.txt").unwrap_err();
+        assert!(err.contains("exited with status"), "unexpected error: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
