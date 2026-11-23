@@ -1,4 +1,4 @@
-use crate::git::{DiffFile, FileStatus};
+use crate::git::{DiffFile, FileStatus, StagedFile};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
@@ -32,7 +32,9 @@ pub enum TreeRowKind {
     },
     File {
         path: String,
+        old_path: Option<String>,
         status: FileStatus,
+        worktree_status: Option<FileStatus>,
         additions: usize,
         deletions: usize,
     },
@@ -54,7 +56,9 @@ struct DirBuilder {
 struct FileEntry {
     name: String,
     path: String,
+    old_path: Option<String>,
     status: FileStatus,
+    worktree_status: Option<FileStatus>,
     additions: usize,
     deletions: usize,
 }
@@ -65,24 +69,70 @@ pub fn build_tree_rows(files: &[&DiffFile], collapsed_dirs: &HashSet<String>) ->
     let mut root = DirBuilder::default();
 
     for file in files {
-        let parts: Vec<&str> = file.path.split('/').collect();
-        let mut cursor = &mut root;
-        for dir in &parts[..parts.len().saturating_sub(1)] {
-            cursor = cursor.dirs.entry((*dir).to_owned()).or_default();
-        }
-        let name = parts.last().copied().unwrap_or(&file.path).to_owned();
-        cursor.files.push(FileEntry {
-            name,
-            path: file.path.clone(),
-            status: file.status,
-            additions: file.additions,
-            deletions: file.deletions,
-        });
+        insert_file_entry(
+            &mut root,
+            &file.path,
+            file.old_path.clone(),
+            file.status,
+            None,
+            file.additions,
+            file.deletions,
+        );
     }
 
     let mut rows = Vec::new();
     flatten_dir(&root, "", "", collapsed_dirs, &mut rows);
     rows
+}
+
+/// Builds a flattened directory tree for staged files, preserving worktree update status.
+pub fn build_staged_tree_rows(
+    files: &[&StagedFile],
+    collapsed_dirs: &HashSet<String>,
+) -> Vec<TreeRow> {
+    let mut root = DirBuilder::default();
+
+    for file in files {
+        insert_file_entry(
+            &mut root,
+            &file.path,
+            file.old_path.clone(),
+            file.status,
+            file.worktree_status,
+            0,
+            0,
+        );
+    }
+
+    let mut rows = Vec::new();
+    flatten_dir(&root, "", "", collapsed_dirs, &mut rows);
+    rows
+}
+
+fn insert_file_entry(
+    root: &mut DirBuilder,
+    path: &str,
+    old_path: Option<String>,
+    status: FileStatus,
+    worktree_status: Option<FileStatus>,
+    additions: usize,
+    deletions: usize,
+) {
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut cursor = root;
+    for dir in &parts[..parts.len().saturating_sub(1)] {
+        cursor = cursor.dirs.entry((*dir).to_owned()).or_default();
+    }
+    let name = parts.last().copied().unwrap_or(path).to_owned();
+    cursor.files.push(FileEntry {
+        name,
+        path: path.to_owned(),
+        old_path,
+        status,
+        worktree_status,
+        additions,
+        deletions,
+    });
 }
 
 fn flatten_dir(
@@ -151,7 +201,9 @@ fn flatten_dir(
             label: entry.name.clone(),
             kind: TreeRowKind::File {
                 path: entry.path.clone(),
+                old_path: entry.old_path.clone(),
                 status: entry.status,
+                worktree_status: entry.worktree_status,
                 additions: entry.additions,
                 deletions: entry.deletions,
             },

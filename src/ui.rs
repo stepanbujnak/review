@@ -1,6 +1,6 @@
-use crate::git::{DiffFile, DiffLineKind, DiffOptions, FileStatus};
-use crate::state::AppState;
-use crate::tree::{TreeRowKind, build_tree_rows};
+use crate::git::{DiffFile, DiffLineKind, DiffOptions, FileStatus, LoadedDiff};
+use crate::state::{ActiveItem, AppState};
+use crate::tree::{TreeRowKind, build_staged_tree_rows, build_tree_rows};
 use opentui::prelude::*;
 use opentui::widget::ScrollCause;
 use std::cell::RefCell;
@@ -74,18 +74,22 @@ impl WheelAxisFilter {
     }
 }
 
-pub type DiffLoader = Rc<dyn Fn(&DiffOptions) -> std::result::Result<Vec<DiffFile>, String>>;
+pub type DiffLoader = Rc<dyn Fn(&DiffOptions) -> std::result::Result<LoadedDiff, String>>;
 pub type FileOpener = Rc<dyn Fn(&str) -> std::result::Result<(), String>>;
+pub type FileStager = Rc<dyn Fn(&str, Option<&str>) -> std::result::Result<(), String>>;
+pub type FileUnstager = Rc<dyn Fn(&str, Option<&str>) -> std::result::Result<(), String>>;
 
 struct SideFileRow {
     widget: Text,
     prefix: String,
     label: String,
     status: FileStatus,
+    worktree_status: Option<FileStatus>,
+    is_staged: bool,
 }
 
 struct FileSection {
-    path: String,
+    item: ActiveItem,
     view: View,
     header_text: Text,
     header_width: u32,
@@ -99,12 +103,14 @@ struct UiContext {
     state: AppState,
     loader: DiffLoader,
     opener: FileOpener,
+    stager: FileStager,
+    unstager: FileUnstager,
     side_panel: View,
     side_scroll: ScrollBox,
     main_scroll: ScrollBox,
     btn_files: Text,
     btn_config: Text,
-    btn_review: Text,
+    btn_stage: Text,
     btn_edit: Text,
     footer_status: Text,
     config_overlay: View,
@@ -113,18 +119,27 @@ struct UiContext {
     config_selected: usize,
     /// Ordered list of file sections currently mounted in `main_scroll`.
     sections: Vec<FileSection>,
+    /// Whether `main_scroll` is currently displaying staged diffs (`true`) or changed diffs (`false`).
+    main_showing_staged: bool,
     /// Filters accidental diagonal cross-axis trackpad ticks while scrolling.
     wheel_filter: WheelAxisFilter,
-    /// Map of unreviewed file path -> its side panel row for fast highlight updates.
-    side_file_widgets: HashMap<String, SideFileRow>,
-    /// Last error message from reloading git diff, if any.
+    /// Map of sidebar item -> its side panel row for fast highlight updates.
+    side_file_widgets: HashMap<ActiveItem, SideFileRow>,
+    /// Last error message from git or editor operations, if any.
     last_error: Option<String>,
-    /// File path to scroll to once the next rebuild's layout has been computed.
-    pending_scroll_to: Option<String>,
+    /// Item to scroll to once the next rebuild's layout has been computed.
+    pending_scroll_to: Option<ActiveItem>,
 }
 
 /// Mounts the complete reviewer UI onto `app.root()` and binds all keyboard/mouse handlers.
-pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: FileOpener) {
+pub fn mount(
+    app: &App,
+    initial_state: AppState,
+    loader: DiffLoader,
+    opener: FileOpener,
+    stager: FileStager,
+    unstager: FileUnstager,
+) {
     let root = app.root();
     root.column();
 
@@ -161,14 +176,14 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: Fil
 
     let btn_files = make_footer_button(app);
     let btn_config = make_footer_button(app);
-    let btn_review = make_footer_button(app);
+    let btn_stage = make_footer_button(app);
     let btn_edit = make_footer_button(app);
 
     let footer_buttons = View::new(app)
         .row()
         .gap(1)
         .shrink(0.0)
-        .child(&btn_review)
+        .child(&btn_stage)
         .child(&btn_edit)
         .child(&btn_files)
         .child(&btn_config);
@@ -235,12 +250,14 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: Fil
         state: initial_state,
         loader,
         opener,
+        stager,
+        unstager,
         side_panel,
         side_scroll,
         main_scroll: main_scroll.clone(),
         btn_files: btn_files.clone(),
         btn_config: btn_config.clone(),
-        btn_review: btn_review.clone(),
+        btn_stage: btn_stage.clone(),
         btn_edit: btn_edit.clone(),
         footer_status,
         config_overlay: config_overlay.clone(),
@@ -248,6 +265,7 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: Fil
         config_open: false,
         config_selected: 0,
         sections: Vec::new(),
+        main_showing_staged: false,
         wheel_filter: WheelAxisFilter::default(),
         side_file_widgets: HashMap::new(),
         last_error: None,
@@ -268,7 +286,13 @@ pub fn mount(app: &App, initial_state: AppState, loader: DiffLoader, opener: Fil
     }
     {
         let ctx_btn = Rc::clone(&ctx);
-        btn_review.on_click(move |_cx, _ev| mark_current_reviewed(&ctx_btn));
+        btn_stage.on_click(move |_cx, _ev| {
+            if ctx_btn.borrow().state.viewing_staged() {
+                unstage_current_file(&ctx_btn);
+            } else {
+                stage_current_file(&ctx_btn);
+            }
+        });
     }
     {
         let ctx_btn = Rc::clone(&ctx);
@@ -462,25 +486,80 @@ fn wrap_mode(wrap_lines: bool) -> WrapMode {
     }
 }
 
-fn mark_current_reviewed(ctx: &Rc<RefCell<UiContext>>) {
-    let changed = {
-        let mut inner = ctx.borrow_mut();
-        inner.state.mark_active_reviewed().is_some()
-    };
-    if changed {
-        let next_target = ctx.borrow().state.active_file.clone();
-        ctx.borrow_mut().pending_scroll_to = next_target.clone();
-        rebuild_all(ctx);
-        if next_target.is_none() {
-            ctx.borrow().main_scroll.scroll_to(0.0, 0.0);
+fn stage_current_file(ctx: &Rc<RefCell<UiContext>>) {
+    let (stager, path, old_path, next_target) = {
+        let inner = ctx.borrow();
+        if !inner.state.can_stage() {
+            return;
         }
+        let Some(file) = inner.state.active_changed_file() else {
+            return;
+        };
+        let next_target = inner.state.next_item_after_staging(&file.path);
+        (
+            Rc::clone(&inner.stager),
+            file.path.clone(),
+            file.old_path.clone(),
+            next_target,
+        )
+    };
+
+    match stager(&path, old_path.as_deref()) {
+        Ok(()) => reload_from_git_with_preferred(ctx, next_target),
+        Err(err) => {
+            let mut inner = ctx.borrow_mut();
+            inner.last_error = Some(err);
+            update_footer(&inner);
+        }
+    }
+}
+
+fn unstage_current_file(ctx: &Rc<RefCell<UiContext>>) {
+    let (unstager, path, old_path, next_target) = {
+        let inner = ctx.borrow();
+        if !inner.state.can_stage() {
+            return;
+        }
+        let Some(file) = inner.state.active_staged_file() else {
+            return;
+        };
+        let next_target = inner.state.next_item_after_unstaging(&file.path);
+        (
+            Rc::clone(&inner.unstager),
+            file.path.clone(),
+            file.old_path.clone(),
+            next_target,
+        )
+    };
+
+    match unstager(&path, old_path.as_deref()) {
+        Ok(()) => reload_from_git_with_preferred(ctx, next_target),
+        Err(err) => {
+            let mut inner = ctx.borrow_mut();
+            inner.last_error = Some(err);
+            update_footer(&inner);
+        }
+    }
+}
+
+fn select_item(ctx: &Rc<RefCell<UiContext>>, target: ActiveItem) {
+    let needs_main_rebuild = {
+        let inner = ctx.borrow();
+        target.is_staged() != inner.main_showing_staged
+    };
+    update_active_highlight(ctx, Some(target.clone()));
+    if needs_main_rebuild {
+        ctx.borrow_mut().pending_scroll_to = Some(target);
+        rebuild_main_panel(ctx);
+    } else {
+        scroll_to_item(ctx, &target);
     }
 }
 
 fn edit_current_file(ctx: &Rc<RefCell<UiContext>>) {
     let (app, opener, path) = {
         let inner = ctx.borrow();
-        let Some(path) = inner.state.active_file.clone() else {
+        let Some(path) = inner.state.active_path().map(str::to_owned) else {
             return;
         };
         (inner.app.clone(), Rc::clone(&inner.opener), path)
@@ -538,8 +617,13 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
         return;
     }
 
-    if key.matches("r") {
-        mark_current_reviewed(ctx);
+    if key.matches("s") {
+        stage_current_file(ctx);
+        return;
+    }
+
+    if key.matches("u") {
+        unstage_current_file(ctx);
         return;
     }
 
@@ -554,19 +638,17 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
     }
 
     if key.matches("n") {
-        let target = ctx.borrow().state.next_active_file(1);
-        if let Some(path) = target {
-            update_active_highlight(ctx, Some(path.clone()));
-            scroll_to_file(ctx, &path);
+        let target = ctx.borrow().state.next_active_item(1);
+        if let Some(item) = target {
+            select_item(ctx, item);
         }
         return;
     }
 
     if key.matches("p") {
-        let target = ctx.borrow().state.next_active_file(-1);
-        if let Some(path) = target {
-            update_active_highlight(ctx, Some(path.clone()));
-            scroll_to_file(ctx, &path);
+        let target = ctx.borrow().state.next_active_item(-1);
+        if let Some(item) = target {
+            select_item(ctx, item);
         }
         return;
     }
@@ -576,20 +658,20 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
     let page = (f64::from(main.rect().height) / 2.0).max(1.0).floor();
 
     if key.matches("j") || key.matches("down") {
-        main.scroll_by(0.0, 1.0);
+        scroll_vertical_by(&main, 1.0);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("k") || key.matches("up") {
-        main.scroll_by(0.0, -1.0);
+        scroll_vertical_by(&main, -1.0);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("h") || key.matches("left") {
         scroll_horizontal_by(ctx, -4.0);
     } else if key.matches("l") || key.matches("right") {
         scroll_horizontal_by(ctx, 4.0);
     } else if key.matches("pagedown") || key.matches("space") || key.matches("ctrl+d") {
-        main.scroll_by(0.0, page);
+        scroll_vertical_by(&main, page);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("pageup") {
-        main.scroll_by(0.0, -page);
+        scroll_vertical_by(&main, -page);
         sync_active_file_from_scroll(ctx);
     } else if key.matches("g") || key.matches("home") {
         main.scroll_to(0.0, 0.0);
@@ -599,6 +681,13 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
         main.scroll_to_bottom();
         sync_active_file_from_scroll(ctx);
     }
+}
+
+/// Scrolls vertically from the current clamped position without letting upward scrolls
+/// accumulate negative pending offsets at the top edge.
+fn scroll_vertical_by(scroll: &ScrollBox, dy: f64) {
+    let (x, y) = scroll.scroll_position();
+    scroll.scroll_to(x, (y + dy).max(0.0));
 }
 
 fn handle_config_modal_key(key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
@@ -646,22 +735,29 @@ fn handle_config_modal_key(key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
 }
 
 fn reload_from_git(ctx: &Rc<RefCell<UiContext>>) {
+    reload_from_git_with_preferred(ctx, None);
+}
+
+fn reload_from_git_with_preferred(
+    ctx: &Rc<RefCell<UiContext>>,
+    preferred_active: Option<ActiveItem>,
+) {
     let (loader, opts) = {
         let inner = ctx.borrow();
         (Rc::clone(&inner.loader), inner.state.diff_options())
     };
     match loader(&opts) {
-        Ok(files) => {
-            let target_file = {
+        Ok(loaded) => {
+            let target_item = {
                 let mut inner = ctx.borrow_mut();
                 inner.last_error = None;
-                inner.state.reload_files(files);
-                let active = inner.state.active_file.clone();
+                inner.state.reload_files(loaded, preferred_active);
+                let active = inner.state.active_item.clone();
                 inner.pending_scroll_to = active.clone();
                 active
             };
             rebuild_all(ctx);
-            if target_file.is_none() {
+            if target_item.is_none() {
                 ctx.borrow().main_scroll.scroll_to(0.0, 0.0);
             }
         }
@@ -681,40 +777,119 @@ fn rebuild_all(ctx: &Rc<RefCell<UiContext>>) {
 }
 
 fn rebuild_side_panel(ctx: &Rc<RefCell<UiContext>>) {
-    let (app, side_scroll, unreviewed_rows, reviewed_rows, active_file, unreviewed_count, reviewed_count) = {
+    let (
+        app,
+        side_scroll,
+        can_stage,
+        staged_rows,
+        changed_rows,
+        active_item,
+        staged_count,
+        changed_count,
+    ) = {
         let inner = ctx.borrow();
-        let unreviewed = inner.state.unreviewed_files();
-        let reviewed = inner.state.reviewed_files();
-        let u_rows = build_tree_rows(&unreviewed, &inner.state.collapsed_dirs);
-        let r_rows = build_tree_rows(&reviewed, &inner.state.collapsed_dirs);
+        let staged = inner.state.staged_files();
+        let changed = inner.state.changed_files();
+        let s_rows = build_staged_tree_rows(&staged, &inner.state.collapsed_staged_dirs);
+        let c_rows = build_tree_rows(&changed, &inner.state.collapsed_dirs);
         (
             inner.app.clone(),
             inner.side_scroll.clone(),
-            u_rows,
-            r_rows,
-            inner.state.active_file.clone(),
-            unreviewed.len(),
-            reviewed.len(),
+            inner.state.can_stage(),
+            s_rows,
+            c_rows,
+            inner.state.active_item.clone(),
+            staged.len(),
+            changed.len(),
         )
     };
 
     side_scroll.clear();
     let mut file_widgets = HashMap::new();
 
-    // Unreviewed section header.
-    let changed_header = Text::new(&app, format!("Changed ({unreviewed_count})"))
+    // Staged section at the top of the sidebar (shown only when there are staged files).
+    if can_stage && staged_count > 0 {
+        let staged_header = Text::new(&app, format!("Staged ({staged_count})"))
+            .fg(Color::DEFAULT_FOREGROUND)
+            .bold()
+            .selectable(false);
+        side_scroll.add(&staged_header);
+
+        for row in staged_rows {
+            match row.kind {
+                TreeRowKind::Dir { path, .. } => {
+                    let text = Text::new(&app, format!("{}{}", row.prefix, row.label))
+                        .fg(Color::CYAN)
+                        .truncate(true)
+                        .selectable(false)
+                        .mouse_pointer(MousePointer::POINTER);
+                    let ctx_click = Rc::clone(ctx);
+                    text.on_click(move |_cx, _ev| {
+                        ctx_click.borrow_mut().state.toggle_staged_dir(&path);
+                        rebuild_side_panel(&ctx_click);
+                    });
+                    side_scroll.add(&text);
+                }
+                TreeRowKind::File {
+                    path,
+                    status,
+                    worktree_status,
+                    ..
+                } => {
+                    let item = ActiveItem::Staged(path);
+                    let is_active = active_item.as_ref() == Some(&item);
+                    let text = Text::new(
+                        &app,
+                        build_staged_file_spans(
+                            &row.prefix,
+                            &row.label,
+                            status,
+                            worktree_status,
+                            is_active,
+                        ),
+                    )
+                    .truncate(true)
+                    .selectable(false)
+                    .mouse_pointer(MousePointer::POINTER);
+                    let ctx_click = Rc::clone(ctx);
+                    let click_item = item.clone();
+                    text.on_click(move |_cx, _ev| {
+                        select_item(&ctx_click, click_item.clone());
+                    });
+                    file_widgets.insert(
+                        item,
+                        SideFileRow {
+                            widget: text.clone(),
+                            prefix: row.prefix,
+                            label: row.label,
+                            status,
+                            worktree_status,
+                            is_staged: true,
+                        },
+                    );
+                    side_scroll.add(&text);
+                }
+            }
+        }
+
+        let spacer = Text::new(&app, "").selectable(false);
+        side_scroll.add(&spacer);
+    }
+
+    // Changed (unstaged) section.
+    let changed_header = Text::new(&app, format!("Changed ({changed_count})"))
         .fg(Color::DEFAULT_FOREGROUND)
         .bold()
         .selectable(false);
     side_scroll.add(&changed_header);
 
-    if unreviewed_rows.is_empty() {
+    if changed_rows.is_empty() {
         let empty = Text::new(&app, "  (none)")
             .fg(Color::BRIGHT_BLACK)
             .selectable(false);
         side_scroll.add(&empty);
     } else {
-        for row in unreviewed_rows {
+        for row in changed_rows {
             match row.kind {
                 TreeRowKind::Dir { path, .. } => {
                     let text = Text::new(&app, format!("{}{}", row.prefix, row.label))
@@ -734,21 +909,23 @@ fn rebuild_side_panel(ctx: &Rc<RefCell<UiContext>>) {
                     status,
                     ..
                 } => {
-                    let is_active = active_file.as_deref() == Some(path.as_str());
+                    let item = ActiveItem::Changed(path);
+                    let is_active = active_item.as_ref() == Some(&item);
                     let text = build_side_file_row(&app, &row.prefix, &row.label, status, is_active);
                     let ctx_click = Rc::clone(ctx);
-                    let click_path = path.clone();
+                    let click_item = item.clone();
                     text.on_click(move |_cx, _ev| {
-                        update_active_highlight(&ctx_click, Some(click_path.clone()));
-                        scroll_to_file(&ctx_click, &click_path);
+                        select_item(&ctx_click, click_item.clone());
                     });
                     file_widgets.insert(
-                        path,
+                        item,
                         SideFileRow {
                             widget: text.clone(),
                             prefix: row.prefix,
                             label: row.label,
                             status,
+                            worktree_status: None,
+                            is_staged: false,
                         },
                     );
                     side_scroll.add(&text);
@@ -757,50 +934,54 @@ fn rebuild_side_panel(ctx: &Rc<RefCell<UiContext>>) {
         }
     }
 
-    // Reviewed section (shown when at least one file has been marked reviewed).
-    if reviewed_count > 0 {
-        let divider = Text::new(&app, format!("\n── Reviewed ({reviewed_count}) ──"))
-            .fg(Color::BRIGHT_BLACK)
-            .selectable(false);
-        side_scroll.add(&divider);
+    ctx.borrow_mut().side_file_widgets = file_widgets;
+}
 
-        for row in reviewed_rows {
-            match row.kind {
-                TreeRowKind::Dir { path, .. } => {
-                    let text = Text::new(&app, format!("{}{}", row.prefix, row.label))
-                        .fg(Color::BRIGHT_BLACK)
-                        .truncate(true)
-                        .selectable(false)
-                        .mouse_pointer(MousePointer::POINTER);
-                    let ctx_click = Rc::clone(ctx);
-                    text.on_click(move |_cx, _ev| {
-                        ctx_click.borrow_mut().state.toggle_dir(&path);
-                        rebuild_side_panel(&ctx_click);
-                    });
-                    side_scroll.add(&text);
-                }
-                TreeRowKind::File { path, .. } => {
-                    let text = Text::new(&app, format!("{}✓ {}", row.prefix, row.label))
-                        .fg(Color::BRIGHT_BLACK)
-                        .truncate(true)
-                        .selectable(false)
-                        .mouse_pointer(MousePointer::POINTER);
-                    let ctx_click = Rc::clone(ctx);
-                    let click_path = path.clone();
-                    text.on_click(move |_cx, _ev| {
-                        let changed = ctx_click.borrow_mut().state.unmark_reviewed(&click_path);
-                        if changed {
-                            ctx_click.borrow_mut().pending_scroll_to = Some(click_path.clone());
-                            rebuild_all(&ctx_click);
-                        }
-                    });
-                    side_scroll.add(&text);
-                }
-            }
-        }
+fn build_staged_file_spans(
+    prefix: &str,
+    label: &str,
+    status: FileStatus,
+    worktree_status: Option<FileStatus>,
+    active: bool,
+) -> Vec<Span<'static>> {
+    if active {
+        let badge = match worktree_status {
+            Some(wt) => format!("{}{}", status.badge(), wt.badge()),
+            None => status.badge().to_owned(),
+        };
+        return vec![
+            Span::styled(prefix.to_owned(), Style::new().fg(Color::BRIGHT_BLACK)),
+            Span::styled(
+                format!(" {badge} {label} "),
+                Style::new().fg(Color::DEFAULT_FOREGROUND).bold().inverse(),
+            ),
+        ];
     }
 
-    ctx.borrow_mut().side_file_widgets = file_widgets;
+    let mut spans = vec![Span::styled(
+        prefix.to_owned(),
+        Style::new().fg(Color::BRIGHT_BLACK),
+    )];
+    if let Some(wt) = worktree_status {
+        spans.push(Span::styled(
+            status.badge().to_owned(),
+            Style::new().fg(status_color(status)),
+        ));
+        spans.push(Span::styled(
+            format!("{} ", wt.badge()),
+            Style::new().fg(status_color(wt)).bold(),
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("{} ", status.badge()),
+            Style::new().fg(status_color(status)),
+        ));
+    }
+    spans.push(Span::styled(
+        label.to_owned(),
+        Style::new().fg(Color::DEFAULT_FOREGROUND),
+    ));
+    spans
 }
 
 fn build_side_file_spans(
@@ -843,41 +1024,52 @@ fn build_side_file_row(
 }
 
 fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
-    let (app, main_scroll, unreviewed, total, pending_target, wrap_lines) = {
+    let (app, main_scroll, showing_staged, files, staged_count, pending_target, wrap_lines) = {
         let mut inner = ctx.borrow_mut();
-        let unreviewed: Vec<DiffFile> = inner
-            .state
-            .unreviewed_files()
-            .into_iter()
-            .cloned()
-            .collect();
+        let showing_staged = inner.state.viewing_staged();
+        let files: Vec<DiffFile> = if showing_staged {
+            inner.state.staged_diff_files()
+        } else {
+            inner
+                .state
+                .changed_files()
+                .into_iter()
+                .cloned()
+                .collect()
+        };
         (
             inner.app.clone(),
             inner.main_scroll.clone(),
-            unreviewed,
-            inner.state.total_count(),
+            showing_staged,
+            files,
+            inner.state.staged_count(),
             inner.pending_scroll_to.take(),
             inner.state.wrap_lines,
         )
     };
 
     main_scroll.clear();
-    let mut sections = Vec::with_capacity(unreviewed.len());
+    let mut sections = Vec::with_capacity(files.len());
 
-    if unreviewed.is_empty() {
-        let message = if total == 0 {
+    if files.is_empty() {
+        let message = if staged_count == 0 {
             "No git changes."
         } else {
-            "All files marked as reviewed. Open files panel (f) to un-review."
+            "All changes staged. Select a staged file in the files panel (f) or press p to inspect/unstage (u)."
         };
         let empty = View::new(&app)
             .padding(2)
             .child(&Text::new(&app, message).fg(Color::BRIGHT_BLACK));
         main_scroll.add(&empty);
     } else {
-        for file in &unreviewed {
-            let section = build_file_section(&app, file, wrap_lines);
-            if pending_target.as_deref() == Some(file.path.as_str()) {
+        for file in &files {
+            let item = if showing_staged {
+                ActiveItem::Staged(file.path.clone())
+            } else {
+                ActiveItem::Changed(file.path.clone())
+            };
+            let section = build_file_section(&app, file, item.clone(), wrap_lines);
+            if pending_target.as_ref() == Some(&item) {
                 let scroll = main_scroll.clone();
                 let applied = std::cell::Cell::new(false);
                 section.view.on_resize(move |_cx, rect| {
@@ -891,10 +1083,17 @@ fn rebuild_main_panel(ctx: &Rc<RefCell<UiContext>>) {
         }
     }
 
-    ctx.borrow_mut().sections = sections;
+    let mut inner = ctx.borrow_mut();
+    inner.sections = sections;
+    inner.main_showing_staged = showing_staged;
 }
 
-fn build_file_section(app: &App, file: &DiffFile, wrap_lines: bool) -> FileSection {
+fn build_file_section(
+    app: &App,
+    file: &DiffFile,
+    item: ActiveItem,
+    wrap_lines: bool,
+) -> FileSection {
     let mode = wrap_mode(wrap_lines);
     let status_fg = status_color(file.status);
     let mut header_spans = vec![
@@ -968,7 +1167,7 @@ fn build_file_section(app: &App, file: &DiffFile, wrap_lines: bool) -> FileSecti
         .child(&body);
 
     FileSection {
-        path: file.path.clone(),
+        item,
         view,
         header_text,
         header_width,
@@ -1014,8 +1213,8 @@ fn apply_section_horizontal_scroll(section: &mut FileSection, wrap_lines: bool) 
 }
 
 fn active_section_index(inner: &UiContext) -> Option<usize> {
-    if let Some(active) = inner.state.active_file.as_deref()
-        && let Some(idx) = inner.sections.iter().position(|s| s.path == active)
+    if let Some(active) = inner.state.active_item.as_ref()
+        && let Some(idx) = inner.sections.iter().position(|s| &s.item == active)
     {
         return Some(idx);
     }
@@ -1061,10 +1260,10 @@ fn reset_horizontal_scroll(ctx: &Rc<RefCell<UiContext>>) {
     }
 }
 
-fn scroll_to_file(ctx: &Rc<RefCell<UiContext>>, path: &str) {
+fn scroll_to_item(ctx: &Rc<RefCell<UiContext>>, target: &ActiveItem) {
     let mut inner = ctx.borrow_mut();
     let wrap_lines = inner.state.wrap_lines;
-    if let Some(idx) = inner.sections.iter().position(|s| s.path == path) {
+    if let Some(idx) = inner.sections.iter().position(|s| &s.item == target) {
         let target_y = f64::from(inner.sections[idx].view.rect().top).max(0.0);
         inner.main_scroll.scroll_to(0.0, target_y);
         let section = &mut inner.sections[idx];
@@ -1077,11 +1276,11 @@ fn sync_active_file_from_scroll(ctx: &Rc<RefCell<UiContext>>) {
     let detected = {
         let inner = ctx.borrow();
         let viewport_top = inner.main_scroll.rect().screen_y;
-        let mut active: Option<String> = inner.sections.first().map(|s| s.path.clone());
+        let mut active: Option<ActiveItem> = inner.sections.first().map(|s| s.item.clone());
         for section in &inner.sections {
             let rel_y = section.view.rect().screen_y - viewport_top;
             if rel_y <= 1.0 {
-                active = Some(section.path.clone());
+                active = Some(section.item.clone());
             } else {
                 break;
             }
@@ -1089,30 +1288,43 @@ fn sync_active_file_from_scroll(ctx: &Rc<RefCell<UiContext>>) {
         active
     };
 
-    if detected != ctx.borrow().state.active_file {
+    if detected != ctx.borrow().state.active_item {
         update_active_highlight(ctx, detected);
     }
 }
 
-fn update_active_highlight(ctx: &Rc<RefCell<UiContext>>, new_active: Option<String>) {
+fn render_side_row(row: &SideFileRow, active: bool) {
+    if row.is_staged {
+        row.widget.set_text(build_staged_file_spans(
+            &row.prefix,
+            &row.label,
+            row.status,
+            row.worktree_status,
+            active,
+        ));
+    } else {
+        row.widget
+            .set_text(build_side_file_spans(&row.prefix, &row.label, row.status, active));
+    }
+}
+
+fn update_active_highlight(ctx: &Rc<RefCell<UiContext>>, new_active: Option<ActiveItem>) {
     let mut inner = ctx.borrow_mut();
-    let old_active = inner.state.active_file.clone();
+    let old_active = inner.state.active_item.clone();
     if old_active == new_active {
         return;
     }
-    if let Some(old) = old_active.as_deref()
+    if let Some(old) = old_active.as_ref()
         && let Some(row) = inner.side_file_widgets.get(old)
     {
-        row.widget
-            .set_text(build_side_file_spans(&row.prefix, &row.label, row.status, false));
+        render_side_row(row, false);
     }
-    if let Some(new) = new_active.as_deref()
+    if let Some(new) = new_active.as_ref()
         && let Some(row) = inner.side_file_widgets.get(new)
     {
-        row.widget
-            .set_text(build_side_file_spans(&row.prefix, &row.label, row.status, true));
+        render_side_row(row, true);
     }
-    inner.state.active_file = new_active;
+    inner.state.active_item = new_active;
     update_footer(&inner);
 }
 
@@ -1180,13 +1392,30 @@ fn update_footer(inner: &UiContext) {
     style_toggle_button(&inner.btn_files, "f files", files_on);
     style_toggle_button(&inner.btn_config, "c config", inner.config_open);
 
-    if inner.state.active_file.is_some() {
+    if inner.state.can_stage() && inner.state.viewing_staged() {
         inner
-            .btn_review
-            .set_text(" r review ")
+            .btn_stage
+            .set_text(" u unstage ")
+            .fg(Color::BLACK)
+            .bg(Color::YELLOW)
+            .attributes(Attributes::BOLD);
+    } else if inner.state.can_stage() && inner.state.active_changed_file().is_some() {
+        inner
+            .btn_stage
+            .set_text(" s stage ")
             .fg(Color::BLACK)
             .bg(Color::GREEN)
             .attributes(Attributes::BOLD);
+    } else {
+        inner
+            .btn_stage
+            .set_text(" s stage ")
+            .fg(Color::WHITE)
+            .bg(Color::BRIGHT_BLACK)
+            .attributes(Attributes::DIM);
+    }
+
+    if inner.state.active_path().is_some() {
         inner
             .btn_edit
             .set_text(" e edit ")
@@ -1194,12 +1423,6 @@ fn update_footer(inner: &UiContext) {
             .bg(Color::CYAN)
             .attributes(Attributes::BOLD);
     } else {
-        inner
-            .btn_review
-            .set_text(" r review ")
-            .fg(Color::WHITE)
-            .bg(Color::BRIGHT_BLACK)
-            .attributes(Attributes::DIM);
         inner
             .btn_edit
             .set_text(" e edit ")
@@ -1210,14 +1433,22 @@ fn update_footer(inner: &UiContext) {
 
     if let Some(err) = &inner.last_error {
         inner.footer_status.set_text(format!("error: {err}")).fg(Color::RED);
+    } else if inner.state.can_stage() {
+        let staged = inner.state.staged_count();
+        let changed = inner.state.changed_count();
+        let status_text = if changed == 0 {
+            format!("{staged} staged")
+        } else {
+            format!("{staged} staged · {changed} changed")
+        };
+        inner
+            .footer_status
+            .set_text(status_text)
+            .fg(Color::BRIGHT_BLACK);
     } else {
         inner
             .footer_status
-            .set_text(format!(
-                "{}/{} reviewed",
-                inner.state.reviewed_count(),
-                inner.state.total_count()
-            ))
+            .set_text(format!("{} changed", inner.state.changed_count()))
             .fg(Color::BRIGHT_BLACK);
     }
 
@@ -1227,8 +1458,9 @@ fn update_footer(inner: &UiContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{DiffLine, DiffTarget};
+    use crate::git::{DiffLine, DiffTarget, StagedFile};
     use opentui::testing::TestApp;
+    use std::collections::HashSet;
 
     fn sample_files(opts: &DiffOptions) -> Vec<DiffFile> {
         let mut files = vec![
@@ -1319,15 +1551,76 @@ mod tests {
         Rc::new(|_path| Ok(()))
     }
 
+    fn noop_stager() -> FileStager {
+        Rc::new(|_path, _old| Ok(()))
+    }
+
+    fn noop_unstager() -> FileUnstager {
+        Rc::new(|_path, _old| Ok(()))
+    }
+
     fn setup_test_app() -> TestApp {
         let app = TestApp::with_options(
             120,
             30,
             AppOptions::default().with_theme(Theme::terminal()),
         );
-        let state = AppState::new(sample_files(&DiffOptions::default()), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(|opts| Ok(sample_files(opts)));
-        mount(&app, state, loader, noop_opener());
+        let staged_set: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+
+        let load_fn = {
+            let staged_set = Rc::clone(&staged_set);
+            move |opts: &DiffOptions| {
+                let staged_paths = staged_set.borrow();
+                let all = sample_files(opts);
+                let mut files = Vec::new();
+                let mut staged = Vec::new();
+                let mut staged_diffs = Vec::new();
+                for f in all {
+                    if staged_paths.contains(&f.path) {
+                        let staged_status = if f.status == FileStatus::Untracked {
+                            FileStatus::Added
+                        } else {
+                            f.status
+                        };
+                        staged.push(StagedFile {
+                            path: f.path.clone(),
+                            old_path: f.old_path.clone(),
+                            status: staged_status,
+                            worktree_status: None,
+                        });
+                        let mut staged_diff = f;
+                        staged_diff.status = staged_status;
+                        staged_diffs.push(staged_diff);
+                    } else {
+                        files.push(f);
+                    }
+                }
+                Ok(LoadedDiff {
+                    files,
+                    staged,
+                    staged_diffs,
+                })
+            }
+        };
+
+        let initial = load_fn(&DiffOptions::default()).unwrap();
+        let state = AppState::new(initial, DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(load_fn);
+        let stager: FileStager = {
+            let staged_set = Rc::clone(&staged_set);
+            Rc::new(move |path, _old| {
+                staged_set.borrow_mut().insert(path.to_owned());
+                Ok(())
+            })
+        };
+        let unstager: FileUnstager = {
+            let staged_set = Rc::clone(&staged_set);
+            Rc::new(move |path, _old| {
+                staged_set.borrow_mut().remove(path);
+                Ok(())
+            })
+        };
+        mount(&app, state, loader, noop_opener(), stager, unstager);
         app
     }
 
@@ -1335,8 +1628,9 @@ mod tests {
     fn toggles_side_panel_whitespace_and_untracked() {
         let app = setup_test_app();
 
-        // Initial state: side panel shown, whitespace hidden, untracked shown.
+        // Initial state: no staged section when 0 staged, Changed (3) shown, whitespace hidden, untracked shown.
         let screen = capture_text(&app.render());
+        assert!(!screen.contains("Staged ("));
         assert!(screen.contains("Changed (3)"));
         assert!(screen.contains("untracked.txt"));
         assert!(!screen.contains("ws_only.txt"));
@@ -1363,36 +1657,126 @@ mod tests {
     }
 
     #[test]
-    fn mark_reviewed_removes_from_main_and_moves_to_reviewed_section() {
+    fn stage_key_moves_file_to_staged_section_at_top_with_status() {
         let app = setup_test_app();
         let before = capture_text(&app.render());
         assert!(before.contains("+new alpha"));
-        assert!(!before.contains("Reviewed (1)"));
+        assert!(!before.contains("Staged ("));
 
-        // Mark active file (src/alpha.rs) as reviewed.
-        app.press("r");
-        let after = capture_text(&app.render());
+        // Stage active file (src/alpha.rs) with 's'.
+        app.press("s");
+        let capture = app.render();
+        let after = capture_text(&capture);
         assert!(!after.contains("+new alpha"));
-        assert!(after.contains("Reviewed (1)"));
-        assert!(after.contains("✓ alpha.rs"));
-        assert!(after.contains("1/3 reviewed"));
+        assert!(after.contains("Staged (1)"));
+        assert!(after.contains("Changed (2)"));
+        assert!(after.contains("1 staged · 2 changed"));
+
+        // Staged section appears above Changed section and shows status badge `M alpha.rs`.
+        let staged_row = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Staged (1)"))
+            .expect("Staged header");
+        let changed_row = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Changed (2)"))
+            .expect("Changed header");
+        assert!(staged_row < changed_row, "Staged should appear above Changed");
+
+        let alpha_row = (staged_row..changed_row)
+            .find(|&row| capture.row(row).contains("M alpha.rs"))
+            .expect("staged alpha.rs should show M status badge in Staged section");
+        assert!(alpha_row > staged_row && alpha_row < changed_row);
     }
 
     #[test]
-    fn mouse_click_in_side_panel_unreviews_file() {
+    fn staged_but_updated_file_shows_both_statuses_in_sidebar() {
+        let app = TestApp::with_options(
+            120,
+            30,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let loaded = LoadedDiff {
+            files: vec![DiffFile {
+                path: "src/alpha.rs".to_owned(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                is_binary: false,
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: "+updated after stage".to_owned(),
+                }],
+            }],
+            staged: vec![
+                StagedFile {
+                    path: "src/alpha.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Modified,
+                    worktree_status: Some(FileStatus::Modified),
+                },
+                StagedFile {
+                    path: "new.txt".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Added,
+                    worktree_status: Some(FileStatus::Deleted),
+                },
+            ],
+            staged_diffs: Vec::new(),
+        };
+        let state = AppState::new(loaded.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(loaded.clone()));
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
+
+        let capture = app.render();
+        let screen = capture_text(&capture);
+        assert!(screen.contains("Staged (2)"), "screen:\n{screen}");
+        assert!(screen.contains("MM alpha.rs"), "should show MM for staged+modified:\n{screen}");
+        assert!(screen.contains("AD new.txt"), "should show AD for staged-added+deleted:\n{screen}");
+        assert!(screen.contains("Changed (1)"), "screen:\n{screen}");
+    }
+
+    #[test]
+    fn click_or_prev_highlights_staged_file_and_u_unstages_and_hides_empty_section() {
         let app = setup_test_app();
-        app.press("r");
+        app.press("s");
         let capture = app.render();
 
-        // Find the row containing `✓ alpha.rs` in the side panel and click it.
-        let reviewed_row = (0..capture.height)
-            .find(|&row| capture.row(row).contains("✓ alpha.rs"))
-            .expect("reviewed row should be visible in side panel");
+        let staged_header = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Staged (1)"))
+            .expect("Staged header");
+        let changed_header = (0..capture.height)
+            .find(|&row| capture.row(row).contains("Changed (2)"))
+            .expect("Changed header");
+        let staged_row = (staged_header..changed_header)
+            .find(|&row| capture.row(row).contains("M alpha.rs"))
+            .expect("staged alpha.rs row should be visible in side panel");
 
-        app.click(4, reviewed_row as u16);
+        // Clicking a staged file highlights it and shows its staged diff without unstaging it.
+        app.click(6, staged_row as u16);
+        let selected = capture_text(&app.render());
+        assert!(selected.contains("Staged (1)"), "clicking should not unstage:\n{selected}");
+        assert!(selected.contains(" M alpha.rs "), "staged file should be highlighted:\n{selected}");
+        assert!(selected.contains("+new alpha"), "should show staged diff:\n{selected}");
+        assert!(selected.contains(" u unstage "), "footer should show u unstage:\n{selected}");
+
+        // Pressing 'n' navigates from Staged back down into Changed (beta.rs).
+        app.press("n");
+        let back_to_changed = capture_text(&app.render());
+        assert!(back_to_changed.contains(" M beta.rs "));
+        assert!(back_to_changed.contains(" s stage "));
+
+        // Pressing 'p' navigates from Changed up into Staged (alpha.rs).
+        app.press("p");
+        let back_to_staged = capture_text(&app.render());
+        assert!(back_to_staged.contains(" M alpha.rs "));
+        assert!(back_to_staged.contains(" u unstage "));
+
+        // Pressing 'u' unstages alpha.rs; with 0 staged files remaining, Staged section disappears.
+        app.press("u");
         let restored = capture_text(&app.render());
         assert!(restored.contains("+new alpha"));
-        assert!(!restored.contains("Reviewed (1)"));
+        assert!(!restored.contains("Staged ("), "Staged section should disappear when empty:\n{restored}");
+        assert!(restored.contains("Changed (3)"));
     }
 
     #[test]
@@ -1486,9 +1870,22 @@ mod tests {
             ]
         };
 
-        let state = AppState::new(make_tall_files(&DiffOptions::default()), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |opts| Ok(make_tall_files(opts)));
-        mount(&app, state, loader, noop_opener());
+        let state = AppState::new(
+            LoadedDiff {
+                files: make_tall_files(&DiffOptions::default()),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        let loader: DiffLoader = Rc::new(move |opts| {
+            Ok(LoadedDiff {
+                files: make_tall_files(opts),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
+        });
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
         let _ = app.render();
 
         // Jump to second file (src/beta.rs), which is well below the first viewport.
@@ -1512,12 +1909,12 @@ mod tests {
         let footer_y = (capture.height - 1) as u16;
         let footer_row = capture.row(capture.height - 1);
 
-        // Footer shows compact buttons: r review, e edit, f files, c config.
-        let review_pos = footer_row.find(" r review ").expect("review button");
+        // Footer shows compact buttons: s stage, e edit, f files, c config.
+        let stage_pos = footer_row.find(" s stage ").expect("stage button");
         let edit_pos = footer_row.find(" e edit ").expect("edit button");
         let files_pos = footer_row.find(" f files ").expect("files button");
         let config_pos = footer_row.find(" c config ").expect("config button");
-        assert!(review_pos < edit_pos && edit_pos < files_pos && files_pos < config_pos);
+        assert!(stage_pos < edit_pos && edit_pos < files_pos && files_pos < config_pos);
         assert!(!footer_row.contains("^w ws"));
         assert!(!footer_row.contains("^u untracked"));
         assert!(!footer_row.contains("^z wrap"));
@@ -1568,12 +1965,12 @@ mod tests {
         let screen = capture_text(&app.render());
         assert!(!screen.contains("Whitespace changes"));
 
-        // Click review button.
-        let review_x = review_pos as u16 + 2;
-        app.click(review_x, footer_y);
+        // Click stage button.
+        let stage_x = stage_pos as u16 + 2;
+        app.click(stage_x, footer_y);
         let screen = capture_text(&app.render());
-        assert!(screen.contains("Reviewed (1)"));
-        assert!(screen.contains("1/3 reviewed"));
+        assert!(screen.contains("Staged (1)"));
+        assert!(screen.contains("1 staged · 2 changed"));
     }
 
     #[test]
@@ -1602,9 +1999,22 @@ mod tests {
                 },
             ],
         }];
-        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader, noop_opener());
+        let state = AppState::new(
+            LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        let loader: DiffLoader = Rc::new(move |_opts| {
+            Ok(LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
+        });
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
 
         let initial = capture_text(&app.render());
         assert!(initial.contains("START_MARKER"), "initial screen:\n{initial}");
@@ -1756,9 +2166,22 @@ mod tests {
                 ],
             },
         ];
-        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader, noop_opener());
+        let state = AppState::new(
+            LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        let loader: DiffLoader = Rc::new(move |_opts| {
+            Ok(LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
+        });
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
 
         let initial = capture_text(&app.render());
         assert!(initial.contains("ALPHA_START"));
@@ -1826,9 +2249,22 @@ mod tests {
             is_binary: false,
             lines,
         }];
-        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader, noop_opener());
+        let state = AppState::new(
+            LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        let loader: DiffLoader = Rc::new(move |_opts| {
+            Ok(LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
+        });
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
         let _ = app.render();
 
         // A couple of stray horizontal ticks should be ignored by the deadzone.
@@ -1916,9 +2352,22 @@ mod tests {
                 },
             ],
         }];
-        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader, noop_opener());
+        let state = AppState::new(
+            LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        let loader: DiffLoader = Rc::new(move |_opts| {
+            Ok(LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
+        });
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
 
         // Wrap is off by default: long line is clipped.
         let initial = capture_text(&app.render());
@@ -1964,10 +2413,10 @@ mod tests {
         assert!(modal.contains("[ ] Whitespace changes"));
         assert!(modal.contains("[x] Untracked files"));
 
-        // Pressing 'r' while modal is open should NOT mark a file as reviewed.
-        app.press("r");
-        let after_r = capture_text(&app.render());
-        assert!(after_r.contains("0/3 reviewed"));
+        // Pressing 's' while modal is open should NOT stage a file.
+        app.press("s");
+        let after_s = capture_text(&app.render());
+        assert!(after_s.contains("0 staged · 3 changed"));
 
         // Move down to Whitespace changes and toggle with enter.
         app.press("j");
@@ -2010,7 +2459,11 @@ mod tests {
                     text: "+edited in $EDITOR".to_owned(),
                 });
             }
-            Ok(files)
+            Ok(LoadedDiff {
+                files,
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            })
         });
 
         let opened_for_cb = Rc::clone(&opened);
@@ -2021,8 +2474,15 @@ mod tests {
             Ok(())
         });
 
-        let state = AppState::new(sample_files(&DiffOptions::default()), DiffTarget::WorkingTree);
-        mount(&app, state, loader, opener);
+        let state = AppState::new(
+            LoadedDiff {
+                files: sample_files(&DiffOptions::default()),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        mount(&app, state, loader, opener, noop_stager(), noop_unstager());
 
         let capture = app.render();
         let footer_y = (capture.height - 1) as u16;
@@ -2070,20 +2530,109 @@ mod tests {
                 text: "+line".to_owned(),
             }],
         }];
-        let state = AppState::new(files.clone(), DiffTarget::WorkingTree);
-        let loader: DiffLoader = Rc::new(move |_opts| Ok(files.clone()));
-        mount(&app, state, loader, opener);
+        let staged_flag = Rc::new(std::cell::Cell::new(false));
+        let staged_for_loader = Rc::clone(&staged_flag);
+        let loader_files = files.clone();
+        let loader: DiffLoader = Rc::new(move |_opts| {
+            if staged_for_loader.get() {
+                Ok(LoadedDiff {
+                    files: Vec::new(),
+                    staged: vec![StagedFile {
+                        path: "only.rs".to_owned(),
+                        old_path: None,
+                        status: FileStatus::Modified,
+                        worktree_status: None,
+                    }],
+                    staged_diffs: Vec::new(),
+                })
+            } else {
+                Ok(LoadedDiff {
+                    files: loader_files.clone(),
+                    staged: Vec::new(),
+                    staged_diffs: Vec::new(),
+                })
+            }
+        });
+        let staged_for_stager = Rc::clone(&staged_flag);
+        let stager: FileStager = Rc::new(move |_path, _old| {
+            staged_for_stager.set(true);
+            Ok(())
+        });
+        let state = AppState::new(
+            LoadedDiff {
+                files: files.clone(),
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            },
+            DiffTarget::WorkingTree,
+        );
+        mount(&app, state, loader, opener, stager, noop_unstager());
 
         app.press("e");
         let screen = capture_text(&app.render());
         assert_eq!(calls.get(), 1);
         assert!(screen.contains("error: $EDITOR is not set"));
 
-        // Mark the only file as reviewed so active_file is None; pressing 'e' does nothing.
-        app.press("r");
+        // Stage the only file so active_file is None; pressing 'e' does nothing.
+        app.press("s");
         let _ = app.render();
         app.press("e");
         let _ = app.render();
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn pressing_k_at_top_does_not_delay_subsequent_j_scrolling() {
+        let app = TestApp::with_options(
+            100,
+            10,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let mut lines = vec![DiffLine {
+            kind: DiffLineKind::HunkHeader,
+            text: "@@ -1,1 +1,30 @@".to_owned(),
+        }];
+        for i in 0..30 {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Added,
+                text: format!("+line_{i:02}"),
+            });
+        }
+        let files = vec![DiffFile {
+            path: "src/tall.rs".to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 30,
+            deletions: 0,
+            is_binary: false,
+            lines,
+        }];
+        let loaded = LoadedDiff {
+            files,
+            staged: Vec::new(),
+            staged_diffs: Vec::new(),
+        };
+        let state = AppState::new(loaded.clone(), DiffTarget::WorkingTree);
+        let loader: DiffLoader = Rc::new(move |_opts| Ok(loaded.clone()));
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
+
+        let initial = capture_text(&app.render());
+        assert!(initial.contains("M src/tall.rs"));
+
+        // Press 'k' many times while already at the top of the diff view.
+        for _ in 0..25 {
+            app.press("k");
+        }
+        let _ = app.render();
+
+        // A few 'j' presses should immediately scroll the header off the top of the viewport.
+        for _ in 0..4 {
+            app.press("j");
+        }
+        let after_j = capture_text(&app.render());
+        assert!(
+            !after_j.contains("M src/tall.rs"),
+            "scrolling down with 'j' after pressing 'k' at top should take effect immediately:\n{after_j}"
+        );
     }
 }

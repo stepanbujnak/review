@@ -3,7 +3,7 @@ mod state;
 mod tree;
 mod ui;
 
-use crate::git::{DiffTarget, load_diff, repo_root};
+use crate::git::{DiffTarget, load_diff, repo_root, stage_file, unstage_file};
 use crate::state::AppState;
 use opentui::prelude::*;
 use std::env;
@@ -42,9 +42,10 @@ KEYBINDINGS:
     ctrl+w                Toggle whitespace changes (hidden by default)
     ctrl+u                Toggle untracked files (shown by default)
     ctrl+z                Toggle line wrapping (off by default)
-    r                     Mark currently viewed file as reviewed
+    s                     Stage currently viewed file
+    u                     Unstage currently selected staged file
     e                     Edit currently viewed file in $EDITOR
-    n / p                 Next / previous unreviewed file
+    n / p                 Next / previous file (across staged & changed)
     j / k / h / l         Scroll down / up / left / right
     PageUp / PageDown     Scroll half a page
     g / G                 Jump to top / bottom
@@ -82,7 +83,7 @@ fn main() {
         ..git::DiffOptions::default()
     };
 
-    let files = load_diff(&root, &initial_opts).unwrap_or_else(|err| {
+    let loaded = load_diff(&root, &initial_opts).unwrap_or_else(|err| {
         eprintln!("error: {err}");
         process::exit(1);
     });
@@ -101,9 +102,15 @@ fn main() {
     let loader: ui::DiffLoader = Rc::new(move |opts| load_diff(&loader_root, opts));
     let opener_root = root.clone();
     let opener: ui::FileOpener = Rc::new(move |rel_path| open_in_editor(&opener_root, rel_path));
-    let initial_state = AppState::new(files, target);
+    let stager_root = root.clone();
+    let stager: ui::FileStager =
+        Rc::new(move |rel_path, old_path| stage_file(&stager_root, rel_path, old_path));
+    let unstager_root = root.clone();
+    let unstager: ui::FileUnstager =
+        Rc::new(move |rel_path, old_path| unstage_file(&unstager_root, rel_path, old_path));
+    let initial_state = AppState::new(loaded, target);
 
-    ui::mount(&app, initial_state, loader, opener);
+    ui::mount(&app, initial_state, loader, opener, stager, unstager);
 
     if let Err(err) = app.run() {
         eprintln!("error: {err}");

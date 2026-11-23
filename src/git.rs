@@ -2,9 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Git's well-known empty tree hash, used as the diff base when `HEAD` is unborn.
-const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 /// Maximum untracked file size to read into memory (2 MiB).
 const MAX_UNTRACKED_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -65,8 +62,23 @@ impl DiffFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: FileStatus,
+    pub worktree_status: Option<FileStatus>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadedDiff {
+    pub files: Vec<DiffFile>,
+    pub staged: Vec<StagedFile>,
+    pub staged_diffs: Vec<DiffFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffTarget {
-    /// Working tree changes compared against `HEAD` (or empty tree if no commits exist).
+    /// Working tree changes compared against the index (plus staged status & untracked files).
     WorkingTree,
     /// Staged changes only (`git diff --cached`).
     Staged,
@@ -120,8 +132,8 @@ fn has_head_commit(repo_root: &Path) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// Loads all changed files (and optionally untracked files) for `repo_root`.
-pub fn load_diff(repo_root: &Path, opts: &DiffOptions) -> Result<Vec<DiffFile>, String> {
+/// Loads changed files (and staged/untracked files in `WorkingTree` mode) for `repo_root`.
+pub fn load_diff(repo_root: &Path, opts: &DiffOptions) -> Result<LoadedDiff, String> {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_root);
     cmd.args(["diff", "--no-color", "--no-ext-diff", "-M"]);
@@ -131,11 +143,8 @@ pub fn load_diff(repo_root: &Path, opts: &DiffOptions) -> Result<Vec<DiffFile>, 
 
     match &opts.target {
         DiffTarget::WorkingTree => {
-            if has_head_commit(repo_root) {
-                cmd.arg("HEAD");
-            } else {
-                cmd.arg(EMPTY_TREE_HASH);
-            }
+            // Diff index against working tree so staged changes live in the Staged section
+            // while unstaged/updated changes appear in the main diff view.
         }
         DiffTarget::Staged => {
             cmd.arg("--cached");
@@ -161,17 +170,195 @@ pub fn load_diff(repo_root: &Path, opts: &DiffOptions) -> Result<Vec<DiffFile>, 
     let raw_diff = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&raw_diff);
 
-    if matches!(opts.target, DiffTarget::WorkingTree) && !opts.hide_untracked {
-        let untracked = load_untracked_files(repo_root)?;
-        for file in untracked {
-            if !files.iter().any(|existing| existing.path == file.path) {
-                files.push(file);
+    let (staged, staged_diffs) = if matches!(opts.target, DiffTarget::WorkingTree) {
+        if !opts.hide_untracked {
+            let untracked = load_untracked_files(repo_root)?;
+            for file in untracked {
+                if !files.iter().any(|existing| existing.path == file.path) {
+                    files.push(file);
+                }
             }
+        }
+        let staged = load_staged_files(repo_root)?;
+        let staged_diffs = if staged.is_empty() {
+            Vec::new()
+        } else {
+            load_staged_diffs(repo_root, opts.hide_whitespace)?
+        };
+        (staged, staged_diffs)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(LoadedDiff {
+        files,
+        staged,
+        staged_diffs,
+    })
+}
+
+fn load_staged_diffs(repo_root: &Path, hide_whitespace: bool) -> Result<Vec<DiffFile>, String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_root);
+    cmd.args(["diff", "--cached", "--no-color", "--no-ext-diff", "-M"]);
+    if hide_whitespace {
+        cmd.arg("-w");
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run git diff --cached: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            "git diff --cached failed".to_owned()
+        } else {
+            stderr
+        });
+    }
+
+    let raw_diff = String::from_utf8_lossy(&output.stdout);
+    let mut files = parse_unified_diff(&raw_diff);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Stages a working tree file (or renamed pair) into the Git index.
+pub fn stage_file(repo_root: &Path, path: &str, old_path: Option<&str>) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_root);
+    cmd.args(["add", "--"]);
+    if let Some(old) = old_path
+        && old != path
+    {
+        cmd.arg(old);
+    }
+    cmd.arg(path);
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run git add: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("git add failed for {path}")
+        } else {
+            stderr
+        });
+    }
+
+    Ok(())
+}
+
+/// Unstages a file (or renamed pair) from the Git index while preserving working tree edits.
+pub fn unstage_file(repo_root: &Path, path: &str, old_path: Option<&str>) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_root);
+    if has_head_commit(repo_root) {
+        cmd.args(["reset", "-q", "HEAD", "--"]);
+    } else {
+        cmd.args(["rm", "--cached", "-q", "--"]);
+    }
+    if let Some(old) = old_path
+        && old != path
+    {
+        cmd.arg(old);
+    }
+    cmd.arg(path);
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to unstage file: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("failed to unstage {path}")
+        } else {
+            stderr
+        });
+    }
+
+    Ok(())
+}
+
+fn load_staged_files(repo_root: &Path) -> Result<Vec<StagedFile>, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "-uno"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|err| format!("failed to run git status: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            "git status failed".to_owned()
+        } else {
+            stderr
+        });
+    }
+
+    Ok(parse_porcelain_staged(&output.stdout))
+}
+
+fn porcelain_index_status(code: u8) -> Option<FileStatus> {
+    match code {
+        b'M' | b'T' => Some(FileStatus::Modified),
+        b'A' | b'C' => Some(FileStatus::Added),
+        b'D' => Some(FileStatus::Deleted),
+        b'R' => Some(FileStatus::Renamed),
+        _ => None,
+    }
+}
+
+fn porcelain_worktree_status(code: u8) -> Option<FileStatus> {
+    match code {
+        b'M' | b'T' => Some(FileStatus::Modified),
+        b'D' => Some(FileStatus::Deleted),
+        b'A' => Some(FileStatus::Added),
+        b'R' => Some(FileStatus::Renamed),
+        _ => None,
+    }
+}
+
+/// Parses `git status --porcelain=v1 -z` output and returns all files with staged changes,
+/// including any subsequent working-tree updates (`worktree_status`).
+pub fn parse_porcelain_staged(bytes: &[u8]) -> Vec<StagedFile> {
+    let mut staged = Vec::new();
+    let mut entries = bytes.split(|&b| b == 0).peekable();
+
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 || entry[2] != b' ' {
+            continue;
+        }
+        let x = entry[0];
+        let y = entry[1];
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        let has_orig_path = matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C');
+        let old_path = if has_orig_path {
+            entries
+                .next()
+                .map(|raw| String::from_utf8_lossy(raw).into_owned())
+        } else {
+            None
+        };
+
+        if let Some(status) = porcelain_index_status(x) {
+            let worktree_status = porcelain_worktree_status(y);
+            staged.push(StagedFile {
+                path,
+                old_path,
+                status,
+                worktree_status,
+            });
         }
     }
 
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+    staged.sort_by(|a, b| a.path.cmp(&b.path));
+    staged
 }
 
 fn load_untracked_files(repo_root: &Path) -> Result<Vec<DiffFile>, String> {
@@ -613,12 +800,13 @@ Binary files /dev/null and b/image.png differ
         fs::write(dir.join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
 
         // Default: hide_whitespace = true, hide_untracked = false.
-        let default_files = load_diff(&dir, &DiffOptions::default()).unwrap();
-        let names: Vec<&str> = default_files.iter().map(|f| f.path.as_str()).collect();
+        let default_loaded = load_diff(&dir, &DiffOptions::default()).unwrap();
+        let names: Vec<&str> = default_loaded.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(names, vec!["blob.bin", "notes.txt"]);
-        assert!(default_files[0].is_binary);
-        assert_eq!(default_files[1].status, FileStatus::Untracked);
-        assert_eq!(default_files[1].additions, 2);
+        assert!(default_loaded.files[0].is_binary);
+        assert_eq!(default_loaded.files[1].status, FileStatus::Untracked);
+        assert_eq!(default_loaded.files[1].additions, 2);
+        assert!(default_loaded.staged.is_empty());
 
         // Show whitespace changes (hide_whitespace = false).
         let with_ws = load_diff(
@@ -630,7 +818,7 @@ Binary files /dev/null and b/image.png differ
             },
         )
         .unwrap();
-        assert!(with_ws.iter().any(|f| f.path == "hello.txt"));
+        assert!(with_ws.files.iter().any(|f| f.path == "hello.txt"));
 
         // Hide untracked files (hide_untracked = true, hide_whitespace = true).
         let no_untracked = load_diff(
@@ -642,7 +830,7 @@ Binary files /dev/null and b/image.png differ
             },
         )
         .unwrap();
-        assert!(no_untracked.is_empty());
+        assert!(no_untracked.files.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -655,10 +843,120 @@ Binary files /dev/null and b/image.png differ
         run_git(&dir, &["add", "staged.txt"]);
         fs::write(dir.join("untracked.txt"), "c\n").unwrap();
 
-        let files = load_diff(&dir, &DiffOptions::default()).unwrap();
-        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let loaded = load_diff(&dir, &DiffOptions::default()).unwrap();
+        let changed_names: Vec<&str> = loaded.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(changed_names, vec!["untracked.txt"]);
+        assert_eq!(loaded.staged.len(), 1);
+        assert_eq!(loaded.staged[0].path, "staged.txt");
+        assert_eq!(loaded.staged[0].status, FileStatus::Added);
+        assert_eq!(loaded.staged[0].worktree_status, None);
+
+        // Unstaging on unborn HEAD removes from index while keeping the file untracked.
+        unstage_file(&dir, "staged.txt", None).unwrap();
+        let after_unstage = load_diff(&dir, &DiffOptions::default()).unwrap();
+        assert!(after_unstage.staged.is_empty());
+        let names: Vec<&str> = after_unstage.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(names, vec!["staged.txt", "untracked.txt"]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn integration_stage_update_and_unstage_workflow() {
+        let dir = make_temp_dir("stage-workflow");
+        run_git(&dir, &["init"]);
+        fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        fs::write(dir.join("to_delete.txt"), "bye\n").unwrap();
+        run_git(&dir, &["add", "tracked.txt", "to_delete.txt"]);
+        run_git(&dir, &["commit", "-m", "init"]);
+
+        // Modify tracked, delete to_delete, create untracked.
+        fs::write(dir.join("tracked.txt"), "v2\n").unwrap();
+        fs::remove_file(dir.join("to_delete.txt")).unwrap();
+        fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+        // Stage all three one by one.
+        stage_file(&dir, "tracked.txt", None).unwrap();
+        stage_file(&dir, "to_delete.txt", None).unwrap();
+        stage_file(&dir, "new.txt", None).unwrap();
+
+        let loaded = load_diff(&dir, &DiffOptions::default()).unwrap();
+        assert!(loaded.files.is_empty());
+        assert_eq!(loaded.staged.len(), 3);
+        assert_eq!(
+            loaded.staged[0],
+            StagedFile {
+                path: "new.txt".to_owned(),
+                old_path: None,
+                status: FileStatus::Added,
+                worktree_status: None,
+            }
+        );
+        assert_eq!(
+            loaded.staged[1],
+            StagedFile {
+                path: "to_delete.txt".to_owned(),
+                old_path: None,
+                status: FileStatus::Deleted,
+                worktree_status: None,
+            }
+        );
+        assert_eq!(
+            loaded.staged[2],
+            StagedFile {
+                path: "tracked.txt".to_owned(),
+                old_path: None,
+                status: FileStatus::Modified,
+                worktree_status: None,
+            }
+        );
+
+        // Update tracked.txt and new.txt after staging -> should show worktree_status = Modified
+        // and reappear in unstaged diff.
+        fs::write(dir.join("tracked.txt"), "v3\n").unwrap();
+        fs::write(dir.join("new.txt"), "hello again\n").unwrap();
+
+        let updated = load_diff(&dir, &DiffOptions::default()).unwrap();
+        let changed_names: Vec<&str> = updated.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(changed_names, vec!["new.txt", "tracked.txt"]);
+        assert_eq!(updated.staged[0].status, FileStatus::Added);
+        assert_eq!(updated.staged[0].worktree_status, Some(FileStatus::Modified));
+        assert_eq!(updated.staged[2].status, FileStatus::Modified);
+        assert_eq!(updated.staged[2].worktree_status, Some(FileStatus::Modified));
+
+        // Unstage tracked.txt -> removed from staged, still present in changed with full v1->v3 diff.
+        unstage_file(&dir, "tracked.txt", None).unwrap();
+        let after_unstage = load_diff(&dir, &DiffOptions::default()).unwrap();
+        assert!(!after_unstage.staged.iter().any(|f| f.path == "tracked.txt"));
+        assert!(after_unstage.files.iter().any(|f| f.path == "tracked.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_porcelain_staged_including_renames_and_updates() {
+        let raw = b"M  clean.rs\0MM updated.rs\0AM added_mod.rs\0AD added_del.rs\0R  new_name.rs\0old_name.rs\0 M unstaged.rs\0?? untracked.rs\0";
+        let staged = parse_porcelain_staged(raw);
+        assert_eq!(staged.len(), 5);
+        assert_eq!(staged[0].path, "added_del.rs");
+        assert_eq!(staged[0].status, FileStatus::Added);
+        assert_eq!(staged[0].worktree_status, Some(FileStatus::Deleted));
+
+        assert_eq!(staged[1].path, "added_mod.rs");
+        assert_eq!(staged[1].status, FileStatus::Added);
+        assert_eq!(staged[1].worktree_status, Some(FileStatus::Modified));
+
+        assert_eq!(staged[2].path, "clean.rs");
+        assert_eq!(staged[2].status, FileStatus::Modified);
+        assert_eq!(staged[2].worktree_status, None);
+
+        assert_eq!(staged[3].path, "new_name.rs");
+        assert_eq!(staged[3].old_path.as_deref(), Some("old_name.rs"));
+        assert_eq!(staged[3].status, FileStatus::Renamed);
+        assert_eq!(staged[3].worktree_status, None);
+
+        assert_eq!(staged[4].path, "updated.rs");
+        assert_eq!(staged[4].status, FileStatus::Modified);
+        assert_eq!(staged[4].worktree_status, Some(FileStatus::Modified));
     }
 }
