@@ -49,7 +49,7 @@ KEYBINDINGS:
     j / k / h / l         Scroll down / up / left / right
     PageUp / PageDown     Scroll half a page
     g / G                 Jump to top / bottom
-    R                     Reload git diff
+    r / R                 Refresh git diff and staged status
     q / ctrl+c            Quit"
     );
 }

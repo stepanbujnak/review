@@ -110,6 +110,7 @@ struct UiContext {
     main_scroll: ScrollBox,
     btn_files: Text,
     btn_config: Text,
+    btn_refresh: Text,
     btn_stage: Text,
     btn_edit: Text,
     footer_status: Text,
@@ -176,6 +177,7 @@ pub fn mount(
 
     let btn_files = make_footer_button(app);
     let btn_config = make_footer_button(app);
+    let btn_refresh = make_footer_button(app);
     let btn_stage = make_footer_button(app);
     let btn_edit = make_footer_button(app);
 
@@ -186,7 +188,8 @@ pub fn mount(
         .child(&btn_stage)
         .child(&btn_edit)
         .child(&btn_files)
-        .child(&btn_config);
+        .child(&btn_config)
+        .child(&btn_refresh);
 
     let footer_status = Text::new(app, "")
         .fg(Color::BRIGHT_BLACK)
@@ -257,6 +260,7 @@ pub fn mount(
         main_scroll: main_scroll.clone(),
         btn_files: btn_files.clone(),
         btn_config: btn_config.clone(),
+        btn_refresh: btn_refresh.clone(),
         btn_stage: btn_stage.clone(),
         btn_edit: btn_edit.clone(),
         footer_status,
@@ -283,6 +287,10 @@ pub fn mount(
     {
         let ctx_btn = Rc::clone(&ctx);
         btn_config.on_click(move |_cx, _ev| toggle_config_modal(&ctx_btn));
+    }
+    {
+        let ctx_btn = Rc::clone(&ctx);
+        btn_refresh.on_click(move |_cx, _ev| reload_from_git(&ctx_btn));
     }
     {
         let ctx_btn = Rc::clone(&ctx);
@@ -632,7 +640,7 @@ fn handle_key(cx: &mut Cx<'_>, key: &KeyEvent, ctx: &Rc<RefCell<UiContext>>) {
         return;
     }
 
-    if key.matches("R") {
+    if key.matches("r") || key.matches("R") {
         reload_from_git(ctx);
         return;
     }
@@ -1391,6 +1399,12 @@ fn update_footer(inner: &UiContext) {
 
     style_toggle_button(&inner.btn_files, "f files", files_on);
     style_toggle_button(&inner.btn_config, "c config", inner.config_open);
+    inner
+        .btn_refresh
+        .set_text(" r refresh ")
+        .fg(Color::WHITE)
+        .bg(Color::BRIGHT_BLACK)
+        .attributes(Attributes::NONE);
 
     if inner.state.can_stage() && inner.state.viewing_staged() {
         inner
@@ -1909,12 +1923,18 @@ mod tests {
         let footer_y = (capture.height - 1) as u16;
         let footer_row = capture.row(capture.height - 1);
 
-        // Footer shows compact buttons: s stage, e edit, f files, c config.
+        // Footer shows compact buttons: s stage, e edit, f files, c config, r refresh.
         let stage_pos = footer_row.find(" s stage ").expect("stage button");
         let edit_pos = footer_row.find(" e edit ").expect("edit button");
         let files_pos = footer_row.find(" f files ").expect("files button");
         let config_pos = footer_row.find(" c config ").expect("config button");
-        assert!(stage_pos < edit_pos && edit_pos < files_pos && files_pos < config_pos);
+        let refresh_pos = footer_row.find(" r refresh ").expect("refresh button");
+        assert!(
+            stage_pos < edit_pos
+                && edit_pos < files_pos
+                && files_pos < config_pos
+                && config_pos < refresh_pos
+        );
         assert!(!footer_row.contains("^w ws"));
         assert!(!footer_row.contains("^u untracked"));
         assert!(!footer_row.contains("^z wrap"));
@@ -2634,5 +2654,126 @@ mod tests {
             !after_j.contains("M src/tall.rs"),
             "scrolling down with 'j' after pressing 'k' at top should take effect immediately:\n{after_j}"
         );
+    }
+
+    #[test]
+    fn refresh_shortcut_and_footer_button_reload_all_views() {
+        let app = TestApp::with_options(
+            120,
+            30,
+            AppOptions::default().with_theme(Theme::terminal()),
+        );
+        let revision = Rc::new(std::cell::Cell::new(0u8));
+        let rev_for_loader = Rc::clone(&revision);
+
+        let loader: DiffLoader = Rc::new(move |_opts| match rev_for_loader.get() {
+            0 => Ok(LoadedDiff {
+                files: vec![DiffFile {
+                    path: "src/alpha.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 0,
+                    is_binary: false,
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Added,
+                        text: "+initial alpha".to_owned(),
+                    }],
+                }],
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            }),
+            1 => Ok(LoadedDiff {
+                files: vec![
+                    DiffFile {
+                        path: "src/alpha.rs".to_owned(),
+                        old_path: None,
+                        status: FileStatus::Modified,
+                        additions: 1,
+                        deletions: 0,
+                        is_binary: false,
+                        lines: vec![DiffLine {
+                            kind: DiffLineKind::Added,
+                            text: "+updated after r".to_owned(),
+                        }],
+                    },
+                    DiffFile {
+                        path: "src/new_file.rs".to_owned(),
+                        old_path: None,
+                        status: FileStatus::Untracked,
+                        additions: 1,
+                        deletions: 0,
+                        is_binary: false,
+                        lines: vec![DiffLine {
+                            kind: DiffLineKind::Added,
+                            text: "+brand new".to_owned(),
+                        }],
+                    },
+                ],
+                staged: vec![StagedFile {
+                    path: "staged_ext.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Added,
+                    worktree_status: None,
+                }],
+                staged_diffs: Vec::new(),
+            }),
+            2 => Err("git refresh failed".to_owned()),
+            _ => Ok(LoadedDiff {
+                files: vec![DiffFile {
+                    path: "src/alpha.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 0,
+                    is_binary: false,
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Added,
+                        text: "+updated after button click".to_owned(),
+                    }],
+                }],
+                staged: Vec::new(),
+                staged_diffs: Vec::new(),
+            }),
+        });
+
+        let initial = loader(&DiffOptions::default()).unwrap();
+        let state = AppState::new(initial, DiffTarget::WorkingTree);
+        mount(&app, state, loader, noop_opener(), noop_stager(), noop_unstager());
+
+        let initial_capture = app.render();
+        let initial_screen = capture_text(&initial_capture);
+        assert!(initial_screen.contains("+initial alpha"));
+        assert!(initial_screen.contains("Changed (1)"));
+        assert!(!initial_screen.contains("Staged ("));
+
+        // External changes happen; pressing 'r' reloads both sidebar and main diff.
+        revision.set(1);
+        app.press("r");
+        let after_r = capture_text(&app.render());
+        assert!(after_r.contains("+updated after r"), "main diff should refresh:\n{after_r}");
+        assert!(after_r.contains("new_file.rs"), "new file should appear in sidebar:\n{after_r}");
+        assert!(after_r.contains("Staged (1)"), "staged section should appear:\n{after_r}");
+        assert!(after_r.contains("staged_ext.rs"), "staged file should appear:\n{after_r}");
+        assert!(after_r.contains("Changed (2)"), "changed count should update:\n{after_r}");
+
+        // Refresh error is shown in footer when pressing 'R'.
+        revision.set(2);
+        app.press("R");
+        let after_err = capture_text(&app.render());
+        assert!(after_err.contains("error: git refresh failed"));
+
+        // Clicking the ' r refresh ' footer button reloads again and clears the error.
+        revision.set(3);
+        let capture = app.render();
+        let footer_y = (capture.height - 1) as u16;
+        let footer_row = capture.row(capture.height - 1);
+        let refresh_x = footer_row.find(" r refresh ").expect("refresh button") as u16 + 2;
+        app.click(refresh_x, footer_y);
+        let after_click = capture_text(&app.render());
+        assert!(after_click.contains("+updated after button click"));
+        assert!(!after_click.contains("error: git refresh failed"));
+        assert!(!after_click.contains("Staged ("));
+        assert!(after_click.contains("Changed (1)"));
     }
 }

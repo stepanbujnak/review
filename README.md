@@ -81,14 +81,14 @@ review --help
 | `PageUp` | Scroll up half a page |
 | `g` / `Home` | Jump to top |
 | `G` / `End` | Jump to bottom |
-| `R` | Reload git diff and staged status |
+| `r` / `R` | Refresh git diff and staged status |
 | `q` / `ctrl+c` | Quit |
 
 ### Mouse Controls
 
 - **Staged & changed files**: Click any file in the side panel to highlight it and view its diff.
 - **Directories**: Click a directory row to collapse or expand it.
-- **Footer bar**: Click `s stage` / `u unstage`, `e edit`, `f files`, or `c config` to trigger the corresponding action.
+- **Footer bar**: Click `s stage` / `u unstage`, `e edit`, `f files`, `c config`, or `r refresh` to trigger the corresponding action.
 - **Config modal**: Click any option (`Wrap lines`, `Whitespace changes`, `Untracked files`) to toggle it, or click outside the modal to close it.
 
 ## Development
